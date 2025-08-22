@@ -53,8 +53,8 @@ def main():
         text_len=512,                     # Wan 2.2 uses 512 by default
         dtype=torch.bfloat16,            # match your training dtype
         device=device,
-        checkpoint_path=os.path.join(args.ckpt_dir, "umt5_xxl.safetensors"),  # adjust if named differently
-        tokenizer_path=Path(args.ckpt_dir) / "tokenizer_umt5_xxl",            # adjust to your layout
+        checkpoint_path=os.path.join(args.ckpt_dir, "models_t5_umt5-xxl-enc-bf16.pth"),  # adjust if named differently
+        tokenizer_path=Path(args.ckpt_dir) / "google/umt5-xxl/",            # adjust to your layout
         shard_fn=None,
     )
     encoder.model.eval()
