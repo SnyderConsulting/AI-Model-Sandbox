@@ -1,0 +1,39 @@
+output_dir = "/workspace/output/wan22_dit_lora_translator"
+epochs = 8
+micro_batch_size_per_gpu = 8
+image_micro_batch_size_per_gpu = 32
+gradient_accumulation_steps = 1
+save_every_n_epochs = 1
+activation_checkpointing = "unsloth"
+steps_per_print = 1
+mixed_precision = "bf16"
+pipeline_stages = 1
+warmup_steps = 500
+disable_block_swap_for_eval = true
+blocks_to_swap = 24
+dataset = "configs/dataset.toml"
+
+[model]
+type                  = "wan"
+ckpt_path             = "/workspace/models/Wan2.2-TI2V-5B"
+llm_path              = "/workspace/output/wan22_te_align/epoch15/text_encoder.safetensors"
+dtype                 = "bfloat16"
+cache_text_embeddings = true      # cache with the *new* TE
+train_text_encoder    = false
+freeze_transformer    = true      # base DiT frozen; LoRA only
+save_text_encoder_full= false
+save_diffusion_model  = false
+timestep_sample_method = "logit_normal"
+
+[adapter]
+type    = "lora"
+rank    = 16
+dropout = 0.10
+train_blocks_range = [20, 29]
+exclude = ["self_attn"]
+include = ["cross_attn.(k|v)", "ffn.0"]
+
+[optimizer]
+type          = "AdamW8bitKahan"
+lr            = 2e-5
+weight_decay  = 0.01
