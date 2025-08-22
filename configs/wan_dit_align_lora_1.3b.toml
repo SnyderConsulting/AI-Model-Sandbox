@@ -1,0 +1,56 @@
+# ── LoRA-only DiT translator (safe-ish, mid-band K+V) ──
+output_dir                      = "/workspace/output/wan_dit_translator_kv"
+dataset                         = "/workspace/diffusion-pipe/configs/dataset.toml"
+epochs                          = 8
+micro_batch_size_per_gpu        = 8
+image_micro_batch_size_per_gpu  = 32
+gradient_accumulation_steps     = 1
+save_every_n_epochs             = 1
+activation_checkpointing        = "unsloth"
+steps_per_print                 = 1
+mixed_precision                 = "bf16"
+pipeline_stages                 = 1
+warmup_steps                    = 800
+disable_block_swap_for_eval     = true
+blocks_to_swap                  = 24
+
+[model]
+type                    = "wan"
+ckpt_path               = "/workspace/models/Wan2.1-T2V-1.3B"
+llm_path                = "/workspace/output/wan_lora_1.3b/20250819_04-28-15/step13750/text_encoder.safetensors"
+dtype                   = "bfloat16"
+cache_text_embeddings   = true      # cache TE embeddings; we don't train TE
+train_text_encoder      = false
+freeze_transformer      = true      # base DiT frozen
+save_text_encoder_full  = false
+save_diffusion_model    = false     # we save adapter only
+
+[model.caption_aug]
+enable           = true
+case_insensitive = true
+single_token     = true
+trim_prob        = 0.50
+keywords         = [ "breast","breasts","boob","boobs","tit","tits","nipple","nipples","areola","areolae",
+                     "penis","cock","dick","shaft","glans","scrotum","testicle","testicles",
+                     "vagina","vulva","labia","clit","clitoris","pussy",
+                     "anus","butt","ass","buttocks","rear","hips",
+                     "sex","oral","blowjob","handjob","penetration","penetrating","ride","riding","doggy" ]
+
+[adapter]
+type              = "lora"
+rank              = 16
+dropout           = 0.10
+train_blocks_range = [10, 21]       # mid-band only
+target_projs      = ["k","v"]       # <— K + V only
+drop_self_attn    = true            # never touch self_attn
+drop_cross_o      = true            # avoid global gain-style artifacts
+hard_disable      = true            # zero-out dropped adapters so they do nothing
+# regex filters (optional): keep empty unless you want even tighter control
+[adapter.filter]
+include = []
+exclude = []
+
+[optimizer]
+type          = "AdamW8bitKahan"
+lr            = 5e-6
+weight_decay  = 0.01

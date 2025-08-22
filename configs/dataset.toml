@@ -1,0 +1,91 @@
+#Global Configs
+resolutions   = [512]
+enable_ar_bucket   = true
+min_ar             = 0.5 # Example: 9:16 portrait
+max_ar             = 2.0 # Example: 16:9 landscape (or wider)
+num_ar_buckets     = 7   # Number of aspect ratio buckets
+
+#########################################
+#  IMAGE DATASET DIRECTORIES
+#########################################
+[[directory]]
+path          = "/workspace/data/image/480p"
+resolutions   = [512]
+num_repeats   = 1
+
+#########################################
+#  VIDEO DATASET DIRECTORIES
+#########################################
+
+# --- 480p Videos ---
+
+#[[directory]]
+#path          = "/workspace/data/video/480p/17frames"
+#resolutions   = [512]
+#frame_buckets = [16]
+#num_repeats   = 1
+
+#[[directory]]
+#path          = "/workspace/data/video/480p/33frames"
+#resolutions   = [512]
+#frame_buckets = [32]
+#batch_size    = 1
+#num_repeats   = 1
+
+#[[directory]]
+#path          = "/workspace/data/video/480p/49frames"
+#resolutions   = [512]
+#frame_buckets = [48]
+#batch_size    = 1
+#num_repeats   = 1
+
+#[[directory]]
+#path          = "/workspace/data/video/480p/65frames"
+#resolutions   = [512]
+#frame_buckets = [64]
+#batch_size    = 1
+#num_repeats   = 1
+
+#[[directory]]
+#path          = "/workspace/data/480p/81frames"
+#resolutions   = [512]
+#frame_buckets = [80]
+#batch_size    = 1
+#num_repeats   = 1
+
+# --- 720p Videos ---
+
+#[[directory]]
+#path          = "/workspace/data/video/720p/17frames"
+#resolutions   = [512]
+#frame_buckets = [16]
+#batch_size    = 1
+#num_repeats   = 1
+
+#[[directory]]
+#path          = "/workspace/data/video/720p/33frames"
+#resolutions   = [768]
+#frame_buckets = [32]
+#batch_size    = 1
+#num_repeats   = 1
+
+#[[directory]]
+#path          = "/workspace/data/video/720p/49frames"
+#resolutions   = [768]
+#frame_buckets = [48]
+#batch_size    = 1
+#num_repeats   = 1
+
+#[[directory]]
+#path          = "/workspace/data/video/720p/65frames"
+#resolutions   = [768]
+#frame_buckets = [64]
+#batch_size    = 1
+#num_repeats   = 1
+
+#[[directory]]
+#path          = "/workspace/data/720p/81frames"
+#resolutions   = [768]
+#frame_buckets = [80]
+#batch_size    = 1
+#num_repeats   = 1
