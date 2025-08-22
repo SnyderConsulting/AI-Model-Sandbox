@@ -771,7 +771,7 @@ class DirectoryDataset:
                                 f"No mask file was found for image {image_file}, not using mask."
                             )
                         mask_files.append(None)
-                    # control (e.g. Flux Kontext)
+                    # control
                     if self.control_path:
                         if image_file.stem not in control_file_stems:
                             raise RuntimeError(
@@ -1094,9 +1094,7 @@ class Dataset:
         self.dataset_config = dataset_config
         self.model = model
         self.model_name = self.model.name
-        # TODO: remove. Doing this because Wan and Cosmos-Predict2 use the same latents.
-        # if self.model_name == 'wan' and len(self.model.get_text_encoders()) == 0:
-        #     self.model_name = 'cosmos_predict2'
+        # Placeholder for legacy models removed in this sandbox.
         self.post_init_called = False
         self.eval_quantile = None
         if not skip_dataset_validation:
@@ -1432,11 +1430,7 @@ class DatasetManager:
             # Free memory in all unneeded submodels. This is easier than trying to delete every reference.
             # TODO: check if this is actually freeing memory.
             for model in self.submodels:
-                if self.model.name == "sdxl" and model is self.vae:
-                    # If full fine tuning SDXL, we need to keep the VAE weights around for saving the model.
-                    model.to("cpu")
-                else:
-                    model.to("meta")
+                model.to("meta")
 
         dist.barrier()
         if is_main_process():

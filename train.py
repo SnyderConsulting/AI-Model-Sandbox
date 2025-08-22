@@ -8,6 +8,7 @@ import time
 import random
 import json
 import inspect
+import types
 from pathlib import Path
 from collections import defaultdict
 
@@ -28,8 +29,10 @@ from utils.common import is_main_process, get_rank, DTYPE_MAP, empty_cuda_cache
 import utils.saver
 from utils.isolate_rng import isolate_rng
 from utils.patches import apply_patches
+from utils.lora import filter_lora_targets
 from utils.unsloth_utils import unsloth_checkpoint
 from utils.pipeline import ManualPipelineModule
+from utils.wan import get_lora_module_names
 
 # needed for broadcasting Queue in dataset.py
 mp.current_process().authkey = b"afsaskgfdjh4"
@@ -158,6 +161,9 @@ def set_config_defaults(config):
             adapter_config.setdefault("dropout", 0.0)
             adapter_config.setdefault("dtype", model_dtype_str)
             adapter_config["dtype"] = DTYPE_MAP[adapter_config["dtype"]]
+            adapter_config.setdefault("exclude", ["self_attn"])
+            adapter_config.setdefault("include", [])
+            adapter_config.setdefault("train_blocks_range", None)
         else:
             raise NotImplementedError(f"Adapter type {adapter_type} is not implemented")
 
@@ -372,11 +378,20 @@ if __name__ == "__main__":
     model_type = config["model"]["type"]
 
     if model_type == "wan":
-        from models.wan import wan
+        try:
+            # package-style: models/wan/wan.py
+            from models.wan import wan as wan_mod
+        except ImportError:
+            # module-style: models/wan.py
+            from models import wan as wan_mod
 
-        model = wan.WanPipeline(config)
+        model = wan_mod.WanPipeline(config)
+        if not hasattr(model, "get_lora_module_names"):
+            model.get_lora_module_names = types.MethodType(
+                get_lora_module_names, model
+            )
     else:
-        raise NotImplementedError(f"Model type {model_type} is not implemented")
+        raise NotImplementedError("Only 'wan' is supported in this sandbox.")
 
     # import sys, PIL
     # test_image = sys.argv[1]
@@ -509,6 +524,7 @@ if __name__ == "__main__":
     model.load_diffusion_model()
 
     if adapter_config := config.get("adapter", None):
+        adapter_config = filter_lora_targets(model, adapter_config)
         model.configure_adapter(adapter_config)
 
         if hasattr(model, "text_encoder") and not model.cache_text_embeddings:

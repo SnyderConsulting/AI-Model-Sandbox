@@ -1,0 +1,33 @@
+output_dir = "/workspace/output/wan22_te_align"
+epochs = 15
+micro_batch_size_per_gpu = 4
+image_micro_batch_size_per_gpu = 16
+gradient_accumulation_steps = 1
+save_every_n_epochs = 1
+activation_checkpointing = "unsloth"
+steps_per_print = 1
+mixed_precision = "bf16"
+pipeline_stages = 1
+warmup_steps = 500
+disable_block_swap_for_eval = true
+dataset = "configs/dataset.toml"
+
+[model]
+type                  = "wan"
+ckpt_path             = "/workspace/models/Wan2.2-TI2V-5B"   # or A14B
+llm_path              = "/workspace/output/your_prev_te/text_encoder.safetensors" # optional init
+dtype                 = "bfloat16"
+cache_text_embeddings = false
+train_text_encoder    = true
+text_train_blocks     = 4   # train top-N TE blocks; adjust to taste
+freeze_transformer    = true
+save_text_encoder_full= true
+save_diffusion_model  = false
+timestep_sample_method = "logit_normal"
+
+[optimizer]
+type          = "AdamW8bitKahan"
+lr            = 2e-5
+weight_decay  = 0.01
+
+# dataset, eval, etc. left as you have them
