@@ -1,0 +1,29 @@
+{
+  "ckpt_name": "Wan2.2-TI2V-5B",
+  "root": "/workspace/models/Wan2.2-TI2V-5B",
+  "model_type_cfg": "ti2v",
+  "dim_cfg": 3072,
+  "num_layers_cfg": 30,
+  "text_len_cfg": 512,
+  "num_heads_cfg": 24,
+  "experts_detected": [
+    "default"
+  ],
+  "i2v_keys_present": false,
+  "num_blocks_guessed": 30,
+  "d_model_guessed": 3072,
+  "attn_key_counts": {
+    "cross_attn.k": 30,
+    "cross_attn.o": 30,
+    "cross_attn.q": 30,
+    "cross_attn.v": 30,
+    "self_attn.k": 30,
+    "self_attn.o": 30,
+    "self_attn.q": 30,
+    "self_attn.v": 30
+  },
+  "ffn_key_counts": {
+    "0": 30,
+    "2": 30
+  }
+}
