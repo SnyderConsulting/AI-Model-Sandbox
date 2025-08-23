@@ -119,7 +119,8 @@ def main():
         dtype=torch.bfloat16,
         device="cpu",  # we move later
         checkpoint_path=str(weight_path),
-        tokenizer_path=str(tok_path),  # <- local path, not HF hub
+        tokenizer_path=ckpt_root
+        / "google/umt5-xxl",  # adjust if your layout differs
         shard_fn=None,
     )
     ensure_pad_token_is_alias(te)  # <---- IMPORTANT
