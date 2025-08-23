@@ -18,6 +18,16 @@ from tools.embdelta_v2.model import EmbDeltaAdapter  # noqa: E402
 from tools.embdelta_v2.utils_io import ensure_dir  # noqa: E402
 
 
+def load_pairs_npz(path: str):
+    data = np.load(path)
+    return (
+        data["E_base"].astype(np.float32),
+        data["E_rew"].astype(np.float32),
+        data["M"].astype(np.float32),
+        data["L"].astype(np.int64),
+    )
+
+
 def seq_mean(E, M):
     m = M.float().unsqueeze(-1)
     denom = m.sum(dim=1).clamp_min(1.0)
@@ -33,11 +43,10 @@ def main():
     ap.add_argument("--device", default="cuda")
     args = ap.parse_args()
 
-    data = np.load(args.cache)
-    base_E = torch.from_numpy(data["base_E"]).to(torch.float32)
-    base_M = torch.from_numpy(data["base_M"]).bool()
-    rew_E = torch.from_numpy(data["rew_E"]).to(torch.float32)
-    rew_M = torch.from_numpy(data["rew_M"]).bool()
+    E_base, E_rew, M_arr, _ = load_pairs_npz(args.cache)
+    base_E = torch.from_numpy(E_base)
+    rew_E = torch.from_numpy(E_rew)
+    M = torch.from_numpy(M_arr)
     N, L, D = base_E.shape
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
@@ -56,15 +65,14 @@ def main():
     with torch.no_grad():
         for i in range(0, N, bs):
             E0 = base_E[i : i + bs].to(device)
-            M0 = base_M[i : i + bs].to(device)
+            M0 = M[i : i + bs].to(device)
             E1 = rew_E[i : i + bs].to(device)
-            M1 = rew_M[i : i + bs].to(device)
             Adj, _, _ = model(E0, M0)
             base_cos_list.append(
-                F.cosine_similarity(seq_mean(E0, M0), seq_mean(E1, M1), dim=-1).cpu()
+                F.cosine_similarity(seq_mean(E0, M0), seq_mean(E1, M0), dim=-1).cpu()
             )
             new_cos_list.append(
-                F.cosine_similarity(seq_mean(Adj, M0), seq_mean(E1, M1), dim=-1).cpu()
+                F.cosine_similarity(seq_mean(Adj, M0), seq_mean(E1, M0), dim=-1).cpu()
             )
 
     base_cos = torch.cat(base_cos_list)
