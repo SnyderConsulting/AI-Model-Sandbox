@@ -18,24 +18,29 @@ from tools.embdelta_v2.model import EmbDeltaAdapter  # noqa: E402
 from tools.embdelta_v2.utils_io import ensure_dir  # noqa: E402
 
 
+def load_pairs_npz(path: str):
+    data = np.load(path)
+    E_base = data["E_base"].astype(np.float32)
+    E_rew = data["E_rew"].astype(np.float32)
+    M = data["M"].astype(np.float32)
+    L = data["L"].astype(np.int64)
+    return E_base, E_rew, M, L
+
+
 class PairCache(Dataset):
     def __init__(self, npz_path: str):
-        data = np.load(npz_path)
-        self.base_E = torch.from_numpy(data["base_E"])  # [N, L, D], float16
-        self.base_M = torch.from_numpy(data["base_M"])  # [N, L], bool
-        self.rew_E = torch.from_numpy(data["rew_E"])
-        self.rew_M = torch.from_numpy(data["rew_M"])
+        E_base, E_rew, M, _ = load_pairs_npz(npz_path)
+        self.base_E = torch.from_numpy(E_base)  # [N, L, D]
+        self.rew_E = torch.from_numpy(E_rew)
+        self.M = torch.from_numpy(M)
         assert self.base_E.shape == self.rew_E.shape
         self.N, self.L, self.D = self.base_E.shape
-        # promote dtype for training stability
-        self.base_E = self.base_E.to(torch.float32)
-        self.rew_E = self.rew_E.to(torch.float32)
 
     def __len__(self):
         return self.N
 
     def __getitem__(self, i):
-        return (self.base_E[i], self.base_M[i], self.rew_E[i], self.rew_M[i])
+        return self.base_E[i], self.rew_E[i], self.M[i]
 
 
 def seq_mean(E, M):
@@ -47,19 +52,18 @@ def seq_mean(E, M):
 def train_one_epoch(model, loader, opt, device, w_anchor, w_orth, w_l2):
     model.train()
     total = 0.0
-    for base_E, base_M, rew_E, rew_M in loader:
-        base_E, base_M = base_E.to(device), base_M.to(device)
-        rew_E, rew_M = rew_E.to(device), rew_M.to(device)
+    for base_E, rew_E, M in loader:
+        base_E, rew_E, M = base_E.to(device), rew_E.to(device), M.to(device)
 
-        adj_E, delta, gate = model(base_E, base_M)
+        adj_E, delta, _ = model(base_E, M)
 
         # Main objective: align pooled embedding with rewritten pooled embedding
-        pooled_adj = seq_mean(adj_E, base_M)
-        pooled_rew = seq_mean(rew_E, rew_M)
+        pooled_adj = seq_mean(adj_E, M)
+        pooled_rew = seq_mean(rew_E, M)
         loss_align = 1.0 - F.cosine_similarity(pooled_adj, pooled_rew, dim=-1).mean()
 
         # Small anchor to keep adjusted close to base pooled geometry (stability)
-        pooled_base = seq_mean(base_E, base_M)
+        pooled_base = seq_mean(base_E, M)
         loss_anchor = (
             1.0 - F.cosine_similarity(pooled_adj, pooled_base, dim=-1)
         ).mean()
@@ -69,13 +73,13 @@ def train_one_epoch(model, loader, opt, device, w_anchor, w_orth, w_l2):
         base_n = base_E.norm(dim=-1).clamp_min(1e-6)
         delta_n = delta.norm(dim=-1).clamp_min(1e-6)
         loss_orth = (
-            (dot / (base_n * delta_n)) ** 2 * base_M.float()
-        ).sum() / base_M.float().sum().clamp_min(1.0)
+            (dot / (base_n * delta_n)) ** 2 * M.float()
+        ).sum() / M.float().sum().clamp_min(1.0)
 
         # Small L2 on delta
         loss_l2 = (
-            delta.pow(2).sum(dim=-1) * base_M.float()
-        ).sum() / base_M.float().sum().clamp_min(1.0)
+            delta.pow(2).sum(dim=-1) * M.float()
+        ).sum() / M.float().sum().clamp_min(1.0)
 
         loss = loss_align + w_anchor * loss_anchor + w_orth * loss_orth + w_l2 * loss_l2
 
@@ -91,14 +95,13 @@ def train_one_epoch(model, loader, opt, device, w_anchor, w_orth, w_l2):
 def evaluate(model, loader, device):
     model.eval()
     base_cos, new_cos = [], []
-    for base_E, base_M, rew_E, rew_M in loader:
-        base_E, base_M = base_E.to(device), base_M.to(device)
-        rew_E, rew_M = rew_E.to(device), rew_M.to(device)
-        adj_E, _, _ = model(base_E, base_M)
+    for base_E, rew_E, M in loader:
+        base_E, rew_E, M = base_E.to(device), rew_E.to(device), M.to(device)
+        adj_E, _, _ = model(base_E, M)
 
-        pooled_rew = seq_mean(rew_E, rew_M)
-        pooled_base = seq_mean(base_E, base_M)
-        pooled_adj = seq_mean(adj_E, base_M)
+        pooled_rew = seq_mean(rew_E, M)
+        pooled_base = seq_mean(base_E, M)
+        pooled_adj = seq_mean(adj_E, M)
 
         base_cos.append(F.cosine_similarity(pooled_base, pooled_rew, dim=-1))
         new_cos.append(F.cosine_similarity(pooled_adj, pooled_rew, dim=-1))

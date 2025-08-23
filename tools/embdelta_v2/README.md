@@ -23,7 +23,7 @@
 2. **Train adapter**
 
    ```bash
-   python tools/embdelta_v2/train_embdelta.py \
+   python tools/embdelta_v2/train_emb_delta.py \
      --cache reports/embdelta_v2/cache/pairs_5b_2.2.npz \
      --out_dir reports/embdelta_v2/run1 \
      --rank 64 --cap 0.22 --epochs 6000 --lr 3e-4 --batch_size 64
@@ -32,7 +32,7 @@
 3. **Evaluate**
 
    ```bash
-   python tools/embdelta_v2/eval_embdelta.py \
+   python tools/embdelta_v2/eval_emb_delta.py \
      --cache reports/embdelta_v2/cache/pairs_5b_2.2.npz \
      --adapter reports/embdelta_v2/run1/embdelta_adapter.pt \
      --out_dir reports/embdelta_v2/run1/eval

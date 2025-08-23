@@ -1,126 +1,135 @@
-from __future__ import annotations
-
 import argparse
-import sys
+import json
+import os
 from pathlib import Path
 
 import numpy as np
 import torch
 
-# Make repo importable from tools/*
-REPO_ROOT = Path(__file__).resolve().parents[2]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.append(str(REPO_ROOT))
-
-from models.wan.t5 import T5EncoderModel  # noqa: E402
-from models.wan import configs as wan_configs  # noqa: E402
-from tools.embdelta_v2.utils_io import read_jsonl, ensure_dir  # noqa: E402
+# Local imports (repo root added by launcher script in our previous setup)
+from models.wan.t5 import T5EncoderModel
 
 
 @torch.no_grad()
-def encode_batch(te: T5EncoderModel, texts: list[str], device: torch.device):
-    # Match Wan pipeline: add_special_tokens=True, return mask
-    ids, mask = te.tokenizer(texts, return_mask=True, add_special_tokens=True)
+def encode_batch(te, prompts, device):
+    """
+    Returns:
+      E: [B, T, H] float32 (encoder hidden/context)
+      M: [B, T]     float32 (0/1 mask)
+      L: [B]        int64   (sequence lengths)
+    """
+    # tokenizer returns padded ids + mask to text_len
+    ids, mask = te.tokenizer(prompts, return_mask=True, add_special_tokens=True)
     ids = ids.to(device)
     mask = mask.to(device)
-    lens = mask.gt(0).sum(dim=1).long()
-    embs = te.model(ids, mask)  # list of [Li, D] tensors
-    D = embs[0].size(-1)
-    L = int(mask.size(1))
-    B = len(embs)
 
-    # pack to padded for saving
-    E = torch.zeros(B, L, D, device=device, dtype=embs[0].dtype)
-    M = torch.zeros(B, L, device=device, dtype=torch.bool)
-    for i, (e, length) in enumerate(zip(embs, lens)):
-        li = int(length.item())
-        E[i, :li] = e[:li]
-        M[i, :li] = True
-    return E.cpu().numpy(), M.cpu().numpy(), lens.cpu().numpy()
+    # No autocast needed; the TE already runs in its native dtype (often bf16).
+    # We only cast *outputs* to fp32 for NumPy compatibility.
+    E = te.model(ids, mask)  # [B, T, H], likely bf16
+    L = mask.gt(0).sum(dim=1).to(torch.long)  # [B]
+    M = mask.to(torch.float32)  # [B, T] -> fp32 mask
+
+    # Cast encoder output to fp32 *before* numpy()
+    E = E.to(torch.float32)
+
+    return E.cpu().numpy(), M.cpu().numpy(), L.cpu().numpy()
+
+
+def find_t5_checkpoint(root: Path) -> Path:
+    """
+    Heuristic finder for the UMT5-XXL checkpoint inside a Wan 2.2 folder.
+    Works whether it's a single .safetensors or a .pth/pt torch state dict.
+    """
+    cand = []
+    for p in root.rglob("*"):
+        if p.is_file():
+            name = p.name.lower()
+            if ("t5" in name or "umt5" in name or "text_encoder" in name) and (
+                name.endswith(".safetensors")
+                or name.endswith(".pth")
+                or name.endswith(".pt")
+            ):
+                cand.append(p)
+    if not cand:
+        raise FileNotFoundError(f"No T5/UMT5 checkpoint found under {root}")
+    # Prefer safetensors if present
+    cand.sort(key=lambda x: (not x.name.endswith(".safetensors"), len(x.as_posix())))
+    return cand[0]
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument(
-        "--jsonl",
-        type=Path,
-        required=True,
-        help="JSONL with fields base_prompt, rewritten_prompt",
+        "--jsonl", required=True, help="JSONL with fields base_prompt, rewritten_prompt"
     )
     ap.add_argument(
-        "--ckpt_root", type=Path, required=True, help="Path to Wan 2.2 5B (TI2V) root"
+        "--ckpt_root", required=True, help="Path to Wan 2.2 model root (folder)"
     )
-    ap.add_argument(
-        "--out",
-        type=Path,
-        default=Path("reports/embdelta_v2/cache/pairs_5b_2.2.npz"),
-    )
-    ap.add_argument("--batch_size", type=int, default=32)
-    ap.add_argument("--device", default="cuda")
+    ap.add_argument("--out", required=True, help="Output .npz path")
+    ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument("--text_len", type=int, default=512)
+    ap.add_argument("--batch_size", type=int, default=8)
     args = ap.parse_args()
 
-    pairs = read_jsonl(args.jsonl)
-    base_prompts = [p["base_prompt"] for p in pairs]
-    rew_prompts = [p["rewritten_prompt"] for p in pairs]
+    ckpt_root = Path(args.ckpt_root)
+    te_ckpt = find_t5_checkpoint(ckpt_root)
+    print(f"[embdelta_v2] Using TE checkpoint: {te_ckpt}")
 
-    # Resolve UMT5 paths via Wan config (TI2V_5B)
-    ckpt_dir = args.ckpt_root
-    wan_cfg = wan_configs.ti2v_5B
-    t5_ckpt = str(ckpt_dir / wan_cfg.t5_checkpoint)
-    t5_tok = str(ckpt_dir / wan_cfg.t5_tokenizer)
-
-    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+    # Initialize encoder (keep weights in native dtype to avoid RAM blow-up)
     te = T5EncoderModel(
-        text_len=wan_cfg.text_len,
-        dtype=torch.bfloat16,
-        device=device,
-        checkpoint_path=t5_ckpt,
-        tokenizer_path=t5_tok,
+        text_len=args.text_len,
+        dtype=torch.bfloat16,  # keep weights in bf16
+        device="cpu",  # we’ll .to(device) below if needed
+        checkpoint_path=os.fspath(te_ckpt),  # PathLike-safe
+        tokenizer_path=ckpt_root
+        / "tokenizer_umt5_xxl",  # adjust if your layout differs
         shard_fn=None,
     )
-    te.model.eval()
+    # Move module to compute device (bf16 on CUDA is fine; CPU will run in fp32 compute)
+    te.model.to(args.device)
 
-    # Encode in mini-batches
-    all_base_E, all_base_M, all_base_lens = [], [], []
-    all_rew_E, all_rew_M, all_rew_lens = [], [], []
+    # Load pairs
+    pairs = []
+    with open(args.jsonl, "r", encoding="utf-8") as f:
+        for line in f:
+            rec = json.loads(line)
+            base = rec.get("base_prompt", "").strip()
+            rew = rec.get("rewritten_prompt", "").strip()
+            if base and rew:
+                pairs.append((base, rew))
+    if not pairs:
+        raise RuntimeError("No (base_prompt, rewritten_prompt) pairs found.")
 
-    bs = args.batch_size
-    for i in range(0, len(base_prompts), bs):
-        chunk = base_prompts[i : i + bs]
-        E, M, L = encode_batch(te, chunk, device)
-        all_base_E.append(E)
-        all_base_M.append(M)
-        all_base_lens.append(L)
+    E_base_list, E_rew_list, M_list, L_list = [], [], [], []
+    B = args.batch_size
+    for i in range(0, len(pairs), B):
+        chunk = pairs[i : i + B]
+        base_prompts = [b for (b, _) in chunk]
+        rew_prompts = [r for (_, r) in chunk]
 
-    for i in range(0, len(rew_prompts), bs):
-        chunk = rew_prompts[i : i + bs]
-        E, M, L = encode_batch(te, chunk, device)
-        all_rew_E.append(E)
-        all_rew_M.append(M)
-        all_rew_lens.append(L)
+        E_base, M, L = encode_batch(te, base_prompts, args.device)
+        E_rew, _, _ = encode_batch(te, rew_prompts, args.device)
 
-    base_E = np.concatenate(all_base_E, axis=0)
-    base_M = np.concatenate(all_base_M, axis=0)
-    base_L = np.concatenate(all_base_lens, axis=0)
-    rew_E = np.concatenate(all_rew_E, axis=0)
-    rew_M = np.concatenate(all_rew_M, axis=0)
-    rew_L = np.concatenate(all_rew_lens, axis=0)
+        E_base_list.append(E_base)  # fp32
+        E_rew_list.append(E_rew)  # fp32
+        M_list.append(M)  # fp32
+        L_list.append(L)  # int64
 
-    out_path = Path(args.out)
-    ensure_dir(out_path.parent)
-    np.savez_compressed(
-        out_path,
-        base_E=base_E,
-        base_M=base_M,
-        base_L=base_L,
-        rew_E=rew_E,
-        rew_M=rew_M,
-        rew_L=rew_L,
-    )
-    print(
-        f"Saved cache: {out_path}  "
-        f"(N={base_E.shape[0]}, L={base_E.shape[1]}, D={base_E.shape[2]})"
-    )
+        if (i // B) % 20 == 0:
+            print(f"Encoded {i+len(chunk)}/{len(pairs)}")
+
+    E_base = np.concatenate(E_base_list, axis=0).astype(np.float32)
+    E_rew = np.concatenate(E_rew_list, axis=0).astype(np.float32)
+    M = np.concatenate(M_list, axis=0).astype(np.float32)
+    L = np.concatenate(L_list, axis=0).astype(np.int64)
+
+    os.makedirs(Path(args.out).parent, exist_ok=True)
+    np.savez_compressed(args.out, E_base=E_base, E_rew=E_rew, M=M, L=L)
+    print(f"[embdelta_v2] Saved cache: {args.out}")
+    print(f"  E_base: {E_base.shape} {E_base.dtype}")
+    print(f"  E_rew : {E_rew.shape} {E_rew.dtype}")
+    print(f"  M     : {M.shape} {M.dtype}")
+    print(f"  L     : {L.shape} {L.dtype}")
 
 
 if __name__ == "__main__":
