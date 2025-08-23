@@ -15,7 +15,6 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.append(str(REPO_ROOT))
 
 from tools.embdelta_v2.model import EmbDeltaAdapter  # noqa: E402
-from tools.embdelta_v2.utils_io import ensure_dir  # noqa: E402
 
 
 def load_pairs_npz(path: str):
@@ -49,7 +48,35 @@ def seq_mean(E, M):
     return (E * m).sum(dim=1) / denom
 
 
-def train_one_epoch(model, loader, opt, device, w_anchor, w_orth, w_l2):
+def _save_checkpoint(adapter, out_dir: Path, step: int, meta: dict):
+    out_dir.mkdir(parents=True, exist_ok=True)
+    ckpt_path = out_dir / f"embdelta_step{step:06d}.pt"
+    meta_path = out_dir / f"embdelta_step{step:06d}.meta.json"
+
+    state = {k: v.cpu() for k, v in adapter.state_dict().items()}
+    torch.save(state, ckpt_path)
+
+    with open(meta_path, "w") as f:
+        json.dump(meta, f, indent=2)
+
+    print(f"[embdelta_v2] Saved checkpoint @ step {step} -> {ckpt_path}")
+
+
+def train_one_epoch(
+    model,
+    loader,
+    opt,
+    device,
+    w_anchor,
+    w_orth,
+    w_l2,
+    *,
+    save_every=0,
+    out_dir=None,
+    args=None,
+    epoch=0,
+    global_step=0,
+):
     model.train()
     total = 0.0
     for base_E, rew_E, M in loader:
@@ -57,18 +84,15 @@ def train_one_epoch(model, loader, opt, device, w_anchor, w_orth, w_l2):
 
         adj_E, delta, _ = model(base_E, M)
 
-        # Main objective: align pooled embedding with rewritten pooled embedding
         pooled_adj = seq_mean(adj_E, M)
         pooled_rew = seq_mean(rew_E, M)
         loss_align = 1.0 - F.cosine_similarity(pooled_adj, pooled_rew, dim=-1).mean()
 
-        # Small anchor to keep adjusted close to base pooled geometry (stability)
         pooled_base = seq_mean(base_E, M)
         loss_anchor = (
             1.0 - F.cosine_similarity(pooled_adj, pooled_base, dim=-1)
         ).mean()
 
-        # Orth penalty (should be small, we also explicitly orthogonalize)
         dot = (delta * base_E).sum(dim=-1)
         base_n = base_E.norm(dim=-1).clamp_min(1e-6)
         delta_n = delta.norm(dim=-1).clamp_min(1e-6)
@@ -76,7 +100,6 @@ def train_one_epoch(model, loader, opt, device, w_anchor, w_orth, w_l2):
             (dot / (base_n * delta_n)) ** 2 * M.float()
         ).sum() / M.float().sum().clamp_min(1.0)
 
-        # Small L2 on delta
         loss_l2 = (
             delta.pow(2).sum(dim=-1) * M.float()
         ).sum() / M.float().sum().clamp_min(1.0)
@@ -88,7 +111,22 @@ def train_one_epoch(model, loader, opt, device, w_anchor, w_orth, w_l2):
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
         total += float(loss.item())
-    return total / len(loader)
+        global_step += 1
+
+        if save_every > 0 and (global_step % save_every == 0):
+            meta = {
+                "step": global_step,
+                "epoch": epoch,
+                "rank": args.rank,
+                "cap": args.cap,
+                "lr": args.lr,
+                "batch_size": args.batch_size,
+                "val_frac": args.val_frac,
+                "device": args.device,
+                "seed": args.seed,
+            }
+            _save_checkpoint(model, out_dir, global_step, meta)
+    return total / len(loader), global_step
 
 
 @torch.no_grad()
@@ -133,6 +171,12 @@ def main():
     ap.add_argument("--w_anchor", type=float, default=0.05)
     ap.add_argument("--w_orth", type=float, default=0.02)
     ap.add_argument("--w_l2", type=float, default=1e-4)
+    ap.add_argument(
+        "--save_every",
+        type=int,
+        default=0,
+        help="If > 0, save an adapter checkpoint every N optimizer steps.",
+    )
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
@@ -156,13 +200,26 @@ def main():
         model.parameters(), lr=args.lr, betas=(0.9, 0.99), weight_decay=0.01
     )
 
-    out_root = ensure_dir(Path(args.out_dir))
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
     best_uplift, best_path = -1e9, None
     log = []
+    global_step = 0
 
     for step in range(1, args.epochs + 1):
-        tr_loss = train_one_epoch(
-            model, tr_ld, opt, device, args.w_anchor, args.w_orth, args.w_l2
+        tr_loss, global_step = train_one_epoch(
+            model,
+            tr_ld,
+            opt,
+            device,
+            args.w_anchor,
+            args.w_orth,
+            args.w_l2,
+            save_every=args.save_every,
+            out_dir=out_dir,
+            args=args,
+            epoch=step,
+            global_step=global_step,
         )
         metrics = evaluate(model, va_ld, device)
         metrics.update({"step": step, "train_loss": tr_loss})
@@ -176,16 +233,15 @@ def main():
 
         if metrics["mean_uplift"] > best_uplift:
             best_uplift = metrics["mean_uplift"]
-            # save
             ck = {
                 "config": {"d_model": ds.D, "rank": args.rank, "cap": args.cap},
                 "state_dict": model.state_dict(),
                 "metrics": metrics,
             }
-            best_path = out_root / "embdelta_adapter.pt"
+            best_path = out_dir / "embdelta_adapter.pt"
             torch.save(ck, best_path)
 
-    with (out_root / "train_log.json").open("w", encoding="utf-8") as f:
+    with (out_dir / "train_log.json").open("w", encoding="utf-8") as f:
         json.dump(log, f, indent=2)
     print(f"Best adapter saved to: {best_path}")
 
