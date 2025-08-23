@@ -42,10 +42,19 @@ def encode_batch(te: T5EncoderModel, texts: list[str], device: torch.device):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument(
-        "--jsonl", required=True, help="JSONL with fields base_prompt, rewritten_prompt"
+        "--jsonl",
+        type=Path,
+        required=True,
+        help="JSONL with fields base_prompt, rewritten_prompt",
     )
-    ap.add_argument("--ckpt_root", required=True, help="Path to Wan 2.2 5B (TI2V) root")
-    ap.add_argument("--out", default="reports/embdelta_v2/cache/pairs_5b_2.2.npz")
+    ap.add_argument(
+        "--ckpt_root", type=Path, required=True, help="Path to Wan 2.2 5B (TI2V) root"
+    )
+    ap.add_argument(
+        "--out",
+        type=Path,
+        default=Path("reports/embdelta_v2/cache/pairs_5b_2.2.npz"),
+    )
     ap.add_argument("--batch_size", type=int, default=32)
     ap.add_argument("--device", default="cuda")
     args = ap.parse_args()
@@ -55,18 +64,18 @@ def main():
     rew_prompts = [p["rewritten_prompt"] for p in pairs]
 
     # Resolve UMT5 paths via Wan config (TI2V_5B)
-    ckpt_dir = Path(args.ckpt_root)
+    ckpt_dir = args.ckpt_root
     wan_cfg = wan_configs.ti2v_5B
-    t5_path = ckpt_dir / wan_cfg.t5_checkpoint
-    tok_path = ckpt_dir / wan_cfg.t5_tokenizer
+    t5_ckpt = str(ckpt_dir / wan_cfg.t5_checkpoint)
+    t5_tok = str(ckpt_dir / wan_cfg.t5_tokenizer)
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     te = T5EncoderModel(
         text_len=wan_cfg.text_len,
         dtype=torch.bfloat16,
         device=device,
-        checkpoint_path=t5_path,
-        tokenizer_path=tok_path,
+        checkpoint_path=t5_ckpt,
+        tokenizer_path=t5_tok,
         shard_fn=None,
     )
     te.model.eval()
