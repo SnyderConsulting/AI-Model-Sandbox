@@ -1,135 +1,174 @@
 import argparse
 import json
-import os
 from pathlib import Path
+from typing import List, Tuple
 
 import numpy as np
 import torch
 
-# Local imports (repo root added by launcher script in our previous setup)
-from models.wan.t5 import T5EncoderModel
+# Ensure repo root on path if running as a module this isn't needed
+try:
+    from models.wan.t5 import T5EncoderModel
+except ModuleNotFoundError:
+    import sys
+
+    ROOT = Path(__file__).resolve().parents[2]
+    sys.path.append(str(ROOT))
+    from models.wan.t5 import T5EncoderModel
 
 
 @torch.no_grad()
-def encode_batch(te, prompts, device):
+def encode_batch(
+    te: T5EncoderModel, prompts: List[str], device: torch.device
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Returns:
-      E: [B, T, H] float32 (encoder hidden/context)
-      M: [B, T]     float32 (0/1 mask)
-      L: [B]        int64   (sequence lengths)
+      E:  [B, L, D] float32
+      M:  [B, L]    bool
+      L:  [B]       int64 (sequence lengths)
     """
-    # tokenizer returns padded ids + mask to text_len
+    # Tokenize (padding requires a pad_token to be present on the HF tokenizer)
     ids, mask = te.tokenizer(prompts, return_mask=True, add_special_tokens=True)
     ids = ids.to(device)
     mask = mask.to(device)
 
-    # No autocast needed; the TE already runs in its native dtype (often bf16).
-    # We only cast *outputs* to fp32 for NumPy compatibility.
-    E = te.model(ids, mask)  # [B, T, H], likely bf16
-    L = mask.gt(0).sum(dim=1).to(torch.long)  # [B]
-    M = mask.to(torch.float32)  # [B, T] -> fp32 mask
+    # Forward through the TE (encoder-only)
+    # te.model(...) returns a list of per-item tensors or a padded batch depending on implementation.
+    # The Wan wrapper returns a list of [len_i, d_model] tensors; we convert to a padded tensor.
+    embs = te.model(ids, mask)  # list(T_i, D) or [B, L, D]
 
-    # Cast encoder output to fp32 *before* numpy()
-    E = E.to(torch.float32)
+    if isinstance(embs, list):
+        # Pad to max length
+        max_len = max(e.shape[0] for e in embs)
+        d_model = embs[0].shape[-1]
+        B = len(embs)
+        E = ids.new_zeros((B, max_len, d_model), dtype=torch.float32)  # fp32 for numpy
+        M = torch.zeros((B, max_len), dtype=torch.bool, device=ids.device)
+        L = torch.zeros((B,), dtype=torch.long, device=ids.device)
+        for i, e in enumerate(embs):
+            L[i] = e.shape[0]
+            E[i, : e.shape[0]] = e.to(torch.float32)
+            M[i, : e.shape[0]] = True
+    else:
+        # Already a batch tensor [B, L, D] (likely bf16); cast to fp32
+        E = embs.to(torch.float32)
+        M = mask.bool()
+        L = M.long().sum(dim=1)
 
     return E.cpu().numpy(), M.cpu().numpy(), L.cpu().numpy()
 
 
-def find_t5_checkpoint(root: Path) -> Path:
+def ensure_pad_token_is_alias(te: T5EncoderModel) -> None:
     """
-    Heuristic finder for the UMT5-XXL checkpoint inside a Wan 2.2 folder.
-    Works whether it's a single .safetensors or a .pth/pt torch state dict.
+    Make sure the underlying HF tokenizer has a pad token without changing vocab size.
+    Prefer aliasing pad->eos (or ->unk) to avoid resizing embeddings.
     """
-    cand = []
-    for p in root.rglob("*"):
-        if p.is_file():
-            name = p.name.lower()
-            if ("t5" in name or "umt5" in name or "text_encoder" in name) and (
-                name.endswith(".safetensors")
-                or name.endswith(".pth")
-                or name.endswith(".pt")
-            ):
-                cand.append(p)
-    if not cand:
-        raise FileNotFoundError(f"No T5/UMT5 checkpoint found under {root}")
-    # Prefer safetensors if present
-    cand.sort(key=lambda x: (not x.name.endswith(".safetensors"), len(x.as_posix())))
-    return cand[0]
+    # te.tokenizer is our wrapper; the underlying HF tokenizer is at .tokenizer
+    hf_tok = getattr(te.tokenizer, "tokenizer", None)
+    if hf_tok is None:
+        return
+
+    # If already set, we're done.
+    if getattr(hf_tok, "pad_token_id", None) is not None:
+        return
+
+    # Prefer EOS, else UNK. These already exist in vocab.
+    if getattr(hf_tok, "eos_token", None) is not None:
+        hf_tok.pad_token = hf_tok.eos_token
+    elif getattr(hf_tok, "unk_token", None) is not None:
+        hf_tok.pad_token = hf_tok.unk_token
+    else:
+        # Last resort: set pad_token_id to 0 (common for T5), without adding a new token.
+        # This assumes id 0 exists in the vocab (true for T5-family).
+        hf_tok.pad_token_id = 0
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument(
-        "--jsonl", required=True, help="JSONL with fields base_prompt, rewritten_prompt"
+        "--jsonl",
+        type=str,
+        required=True,
+        help="Path to JSONL with fields base_prompt, rewritten_prompt",
     )
     ap.add_argument(
-        "--ckpt_root", required=True, help="Path to Wan 2.2 model root (folder)"
+        "--ckpt_root",
+        type=str,
+        required=True,
+        help="Directory containing Wan 2.2 5B assets",
     )
-    ap.add_argument("--out", required=True, help="Output .npz path")
-    ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    ap.add_argument("--text_len", type=int, default=512)
-    ap.add_argument("--batch_size", type=int, default=8)
+    ap.add_argument("--out", type=str, required=True, help="Output .npz cache path")
+    ap.add_argument("--device", type=str, default="cuda")
+    ap.add_argument("--batch_size", type=int, default=16)
     args = ap.parse_args()
 
     ckpt_root = Path(args.ckpt_root)
-    te_ckpt = find_t5_checkpoint(ckpt_root)
-    print(f"[embdelta_v2] Using TE checkpoint: {te_ckpt}")
+    # Prefer Wan 2.2 5B TI2V encoder assets
+    #  - weights: models_t5_umt5-xxl-enc-bf16.pth  (or .safetensors if you converted)
+    #  - tokenizer dir: tokenizer_umt5_xxl
+    weight_path = ckpt_root / "models_t5_umt5-xxl-enc-bf16.pth"
+    tok_path = ckpt_root / "tokenizer_umt5_xxl"
 
-    # Initialize encoder (keep weights in native dtype to avoid RAM blow-up)
+    print(f"[embdelta_v2] Using TE checkpoint: {weight_path}")
+
+    device = torch.device(args.device)
+
+    # Load TE
     te = T5EncoderModel(
-        text_len=args.text_len,
-        dtype=torch.bfloat16,  # keep weights in bf16
-        device="cpu",  # we’ll .to(device) below if needed
-        checkpoint_path=os.fspath(te_ckpt),  # PathLike-safe
-        tokenizer_path=ckpt_root
-        / "tokenizer_umt5_xxl",  # adjust if your layout differs
+        text_len=512,
+        dtype=torch.bfloat16,
+        device="cpu",  # we move later
+        checkpoint_path=str(weight_path),
+        tokenizer_path=str(tok_path),  # <- local path, not HF hub
         shard_fn=None,
     )
-    # Move module to compute device (bf16 on CUDA is fine; CPU will run in fp32 compute)
-    te.model.to(args.device)
+    ensure_pad_token_is_alias(te)  # <---- IMPORTANT
+    te.model.eval().to(device)
 
-    # Load pairs
-    pairs = []
+    # Read the pairs
+    base_prompts, rew_prompts = [], []
     with open(args.jsonl, "r", encoding="utf-8") as f:
         for line in f:
-            rec = json.loads(line)
-            base = rec.get("base_prompt", "").strip()
-            rew = rec.get("rewritten_prompt", "").strip()
-            if base and rew:
-                pairs.append((base, rew))
-    if not pairs:
-        raise RuntimeError("No (base_prompt, rewritten_prompt) pairs found.")
+            j = json.loads(line)
+            if "base_prompt" in j and "rewritten_prompt" in j:
+                base_prompts.append(j["base_prompt"])
+                rew_prompts.append(j["rewritten_prompt"])
 
-    E_base_list, E_rew_list, M_list, L_list = [], [], [], []
-    B = args.batch_size
-    for i in range(0, len(pairs), B):
-        chunk = pairs[i : i + B]
-        base_prompts = [b for (b, _) in chunk]
-        rew_prompts = [r for (_, r) in chunk]
+    assert len(base_prompts) == len(rew_prompts) and len(base_prompts) > 0
+    N = len(base_prompts)
+    print(f"[embdelta_v2] Loaded {N} preference pairs.")
 
-        E_base, M, L = encode_batch(te, base_prompts, args.device)
-        E_rew, _, _ = encode_batch(te, rew_prompts, args.device)
+    all_E_base, all_E_rew, all_M, all_L = [], [], [], []
 
-        E_base_list.append(E_base)  # fp32
-        E_rew_list.append(E_rew)  # fp32
-        M_list.append(M)  # fp32
-        L_list.append(L)  # int64
+    bs = args.batch_size
+    for i in range(0, N, bs):
+        b = slice(i, min(N, i + bs))
+        E_base, M_base, L_base = encode_batch(te, base_prompts[b], device)
+        E_rew, M_rew, L_rew = encode_batch(te, rew_prompts[b], device)
+        # Sanity (masks/lengths should match per-pair after tokenization settings)
+        assert (M_base.shape == M_rew.shape) and (L_base.shape == L_rew.shape)
 
-        if (i // B) % 20 == 0:
-            print(f"Encoded {i+len(chunk)}/{len(pairs)}")
+        all_E_base.append(E_base)
+        all_E_rew.append(E_rew)
+        all_M.append(M_base)  # either is fine; same shapes
+        all_L.append(L_base)
 
-    E_base = np.concatenate(E_base_list, axis=0).astype(np.float32)
-    E_rew = np.concatenate(E_rew_list, axis=0).astype(np.float32)
-    M = np.concatenate(M_list, axis=0).astype(np.float32)
-    L = np.concatenate(L_list, axis=0).astype(np.int64)
+        if (i // bs) % 20 == 0:
+            print(f"Encoded {i + len(base_prompts[b])}/{N}")
 
-    os.makedirs(Path(args.out).parent, exist_ok=True)
-    np.savez_compressed(args.out, E_base=E_base, E_rew=E_rew, M=M, L=L)
-    print(f"[embdelta_v2] Saved cache: {args.out}")
-    print(f"  E_base: {E_base.shape} {E_base.dtype}")
-    print(f"  E_rew : {E_rew.shape} {E_rew.dtype}")
-    print(f"  M     : {M.shape} {M.dtype}")
-    print(f"  L     : {L.shape} {L.dtype}")
+    E_base = np.concatenate(all_E_base, axis=0)
+    E_rew = np.concatenate(all_E_rew, axis=0)
+    M = np.concatenate(all_M, axis=0)
+    L = np.concatenate(all_L, axis=0)
+
+    out_path = Path(args.out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(out_path, E_base=E_base, E_rew=E_rew, M=M, L=L)
+
+    print(
+        f"[embdelta_v2] Saved cache: {out_path}  "
+        f"(E_base={E_base.shape} E_rew={E_rew.shape} M={M.shape} L={L.shape})"
+    )
 
 
 if __name__ == "__main__":
