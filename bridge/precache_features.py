@@ -111,6 +111,7 @@ def main():
             f"(microbatch={args.microbatch})"
         )
 
+        # Make these per-sample lists (NOT per-microbatch tensors)
         llm_h_list, llm_m_list = [], []
         wan_h_list, wan_m_list = [], []
 
@@ -118,42 +119,68 @@ def main():
         for i in range(0, len(buf_caps), args.microbatch):
             caps_mb = buf_caps[i : i + args.microbatch]
 
-            # LLM
-            h_llm, m_llm = encode_llm(caps_mb)
-            # move to CPU immediately to free GPU
-            llm_h_list.append(h_llm.cpu())
-            llm_m_list.append(m_llm.cpu())
-            del h_llm, m_llm
+            # ---- LLM forward (bf16) ----
+            enc = tok(
+                caps_mb,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=args.llm_max_length,
+            ).to(llm.device)
+            with torch.inference_mode(), torch.amp.autocast(
+                "cuda", dtype=torch.bfloat16
+            ):
+                out = llm(
+                    **enc,
+                    output_hidden_states=False,
+                    use_cache=False,
+                    return_dict=True,
+                )
+            h_llm = out.last_hidden_state.to(torch.bfloat16)  # [B_mb, Lt_mb, d_llm]
+            m_llm = enc["attention_mask"].bool()  # [B_mb, Lt_mb]
 
-            # Teacher
-            h_wan, m_wan = encode_teacher(caps_mb)
+            # split to per-sample tensors on CPU
+            h_llm_cpu = h_llm.cpu()
+            m_llm_cpu = m_llm.cpu()
+            for b in range(h_llm_cpu.shape[0]):
+                llm_h_list.append(h_llm_cpu[b])  # [Lt_i, d_llm]
+                llm_m_list.append(m_llm_cpu[b])  # [Lt_i]
+
+            # ---- Teacher forward (bf16) ----
+            with torch.inference_mode():
+                h_wan, m_wan = teacher(caps_mb)  # [B_mb, 512, 4096], [B_mb, 512]
             wan_h_list.append(h_wan.to(torch.bfloat16).cpu())
             wan_m_list.append(m_wan.cpu())
-            del h_wan, m_wan
 
-            # help the allocator between micro-batches
+            # free GPU scratch
+            del h_llm, m_llm, h_wan, m_wan
             torch.cuda.empty_cache()
 
-        # Pad LLM sequences in shard to a common Lt (per shard)
-        llm_h = torch.nn.utils.rnn.pad_sequence(llm_h_list, batch_first=True)
-        llm_m = torch.nn.utils.rnn.pad_sequence(llm_m_list, batch_first=True)
-        wan_h = torch.cat(wan_h_list, dim=0).contiguous()
-        wan_m = torch.cat(wan_m_list, dim=0).contiguous()
+        # pad per-sample lists to a common Lt_shard
+        llm_h = torch.nn.utils.rnn.pad_sequence(
+            llm_h_list, batch_first=True
+        )  # [N, Lt_shard, d_llm]
+        llm_m = torch.nn.utils.rnn.pad_sequence(
+            llm_m_list, batch_first=True
+        )  # [N, Lt_shard]
+
+        # concat teacher lists (already fixed length)
+        wan_h = torch.cat(wan_h_list, dim=0).contiguous()  # [N, 512, 4096]
+        wan_m = torch.cat(wan_m_list, dim=0).contiguous()  # [N, 512]
 
         shard = {
             "idx": buf_idx,
             "captions": buf_caps,
-            "llm_h": llm_h,  # [N, Lt_shard, d_llm] (bf16, CPU)
-            "llm_mask": llm_m,  # [N, Lt_shard] (bool, CPU)
-            "wan_h": wan_h,  # [N, 512, 4096] (bf16, CPU)
-            "wan_mask": wan_m,  # [N, 512] (bool, CPU)
+            "llm_h": llm_h,  # bf16, CPU
+            "llm_mask": llm_m,  # bool, CPU
+            "wan_h": wan_h,  # bf16, CPU
+            "wan_mask": wan_m,  # bool, CPU
         }
         path = out / f"shard_{shard_id:05d}.pt"
         torch.save(shard, path)
         total += len(buf_caps)
         print(f"[precache] wrote {path}  (n={len(buf_caps)}, total={total})")
 
-        # reset buffers
         shard_id += 1
         buf_idx, buf_caps = [], []
 
