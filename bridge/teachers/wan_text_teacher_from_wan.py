@@ -42,7 +42,37 @@ class WanTextTeacher(torch.nn.Module):
             tokenizer_path=str(tok_dir),
             shard_fn=None,
         )
-        self.requires_grad_(False)
+        self._ensure_pad_token()
+        self.eval().requires_grad_(False)
+
+    def _ensure_pad_token(self) -> None:
+        """
+        Ensure the underlying HF tokenizer has a pad token set. Some saved
+        tokenizers omit this, which causes errors when padding captions. Use the
+        eos token if available; otherwise, add a new ``[PAD]`` token. Also set
+        ``padding_side='right'`` to match common T5 encoder usage.
+        """
+        try:
+            tok = getattr(self.enc, "tokenizer", None)
+            hf_tok = getattr(tok, "tokenizer", None) if tok is not None else None
+            if hf_tok is None:
+                return
+
+            if getattr(hf_tok, "padding_side", None) != "right":
+                hf_tok.padding_side = "right"
+
+            if getattr(hf_tok, "pad_token_id", None) is None:
+                if getattr(hf_tok, "eos_token", None) is not None:
+                    hf_tok.pad_token = hf_tok.eos_token
+                else:
+                    hf_tok.add_special_tokens({"pad_token": "[PAD]"})
+
+                if hasattr(tok, "pad_token_id"):
+                    tok.pad_token_id = hf_tok.pad_token_id
+                if hasattr(tok, "pad_token"):
+                    tok.pad_token = hf_tok.pad_token
+        except Exception as e:  # pragma: no cover - warn only
+            print(f"[WanTextTeacher] Warning: could not ensure pad_token: {e}")
 
     @torch.no_grad()
     def forward(self, captions: list[str]) -> tuple[torch.Tensor, torch.BoolTensor]:
