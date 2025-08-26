@@ -26,13 +26,12 @@ class WanTextTeacher(torch.nn.Module):
         / "google"
         / "umt5-xxl",
         L_wan: int = 512,
-        d_wan: int = 3072,
+        d_wan: int | None = None,
         device: str = "cuda",
         dtype: torch.dtype = torch.bfloat16,
     ) -> None:
         super().__init__()
-        self.L_wan = L_wan
-        self.d_wan = d_wan
+        self.L_wan, self.d_wan = L_wan, d_wan
         self.device = device
         self.enc = T5EncoderModel(
             text_len=L_wan,
@@ -76,14 +75,21 @@ class WanTextTeacher(torch.nn.Module):
 
     @torch.no_grad()
     def forward(self, captions: list[str]) -> tuple[torch.Tensor, torch.BoolTensor]:
-        outs = self.enc(captions, self.device)
+        outs = self.enc(captions, self.device)  # list of [L_i, d_enc]
         B = len(outs)
+        if self.d_wan is None:
+            self.d_wan = outs[0].shape[1]
         h = torch.zeros(
             B, self.L_wan, self.d_wan, dtype=torch.bfloat16, device=self.device
         )
         m = torch.zeros(B, self.L_wan, dtype=torch.bool, device=self.device)
         for i, t in enumerate(outs):
             L = min(t.shape[0], self.L_wan)
+            D = t.shape[1]
+            if D != self.d_wan:
+                raise RuntimeError(
+                    f"WanTextTeacher width changed within a batch: got {D}, expected {self.d_wan}"
+                )
             h[i, :L, :] = t[:L].to(h.dtype).to(h.device)
             m[i, :L] = True
         return h, m

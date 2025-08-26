@@ -13,8 +13,6 @@ class MythoMaxBridgeEncoder:
 
     def __init__(
         self,
-        text_len: int = 512,
-        d_wan: int = 3072,
         llm_dir: str | Path = Path(__file__).resolve().parents[3]
         / "models"
         / "MythoMax-L2-13B",
@@ -28,8 +26,6 @@ class MythoMaxBridgeEncoder:
         dtype: torch.dtype = torch.bfloat16,
         device: int | str = torch.cuda.current_device(),
     ) -> None:
-        self.text_len = text_len
-        self.d_wan = d_wan
         self.device = device
         self.dtype = dtype
 
@@ -40,11 +36,16 @@ class MythoMaxBridgeEncoder:
         self.llm.eval().requires_grad_(False)
         d_llm = self.llm.config.hidden_size
 
+        ckpt = torch.load(str(bridge_ckpt), map_location="cpu")
+        cfg = ckpt.get("cfg", {})
+        self.text_len = int(cfg.get("L_wan", 512))
+        self.d_wan = int(cfg.get("d_wan", 4096))
+
         self.bridge = (
             PerceiverBridge(
                 d_llm=d_llm,
-                d_wan=d_wan,
-                L_wan=text_len,
+                d_wan=self.d_wan,
+                L_wan=self.text_len,
                 d_mid=d_mid,
                 n_heads=heads_mid,
                 n_blocks=n_blocks,
@@ -52,7 +53,6 @@ class MythoMaxBridgeEncoder:
             .to(device)
             .eval()
         )
-        ckpt = torch.load(str(bridge_ckpt), map_location="cpu")
         self.bridge.load_state_dict(ckpt["bridge"], strict=True)
 
     @torch.no_grad()
