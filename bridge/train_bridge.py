@@ -80,6 +80,29 @@ def main() -> None:
     )
     llm.eval().requires_grad_(False)
 
+    teacher = None
+    if args.teacher == "wan":
+        teacher = WanTextTeacher(L_wan=args.L_wan, d_wan=None, device=args.device).to(
+            args.device
+        )
+        for p in teacher.parameters():
+            p.requires_grad = False
+        print(f"[{now()}] Using WAN teacher (real UMT5→Wan).")
+    else:
+        print(
+            f"[{now()}] No teacher; training with distribution/shape constraints only."
+        )
+
+    if teacher is not None:
+        with torch.no_grad():
+            h_probe, _ = teacher(["."])
+        auto_L, auto_D = h_probe.shape[1], h_probe.shape[2]
+        if args.L_wan != auto_L or args.d_wan != auto_D:
+            print(
+                f"[{now()}] Auto-detected Wan text interface: L={auto_L}, D={auto_D} (overriding CLI defaults)"
+            )
+            args.L_wan, args.d_wan = int(auto_L), int(auto_D)
+
     bridge = PerceiverBridge(
         d_llm=llm.config.hidden_size,
         d_wan=args.d_wan,
@@ -88,19 +111,6 @@ def main() -> None:
         n_heads=args.heads_mid,
         n_blocks=args.n_blocks,
     ).to(args.device)
-
-    teacher = None
-    if args.teacher == "wan":
-        teacher = WanTextTeacher(
-            L_wan=args.L_wan, d_wan=args.d_wan, device=args.device
-        ).to(args.device)
-        for p in teacher.parameters():
-            p.requires_grad = False
-        print(f"[{now()}] Using WAN teacher (real UMT5→Wan).")
-    else:
-        print(
-            f"[{now()}] No teacher; training with distribution/shape constraints only."
-        )
 
     ds = CaptionsJSONL(args.captions, min_chars=1)
     dl = DataLoader(
@@ -113,14 +123,15 @@ def main() -> None:
     )
 
     optim = torch.optim.AdamW(bridge.parameters(), lr=args.lr, weight_decay=args.adamw)
-    scaler = torch.cuda.amp.GradScaler(enabled=args.fp16)
+    scaler = torch.amp.GradScaler("cuda") if args.fp16 else None
+    autocast_dtype = torch.float16 if args.fp16 else torch.bfloat16
 
     global_step = 0
     for epoch in range(args.epochs):
         for batch_i, texts in enumerate(dl):
             bridge.train()
             llm_h, llm_mask = get_llm_hidden(llm, tok, texts, device=args.device)
-            with torch.cuda.amp.autocast(enabled=args.fp16):
+            with torch.amp.autocast("cuda", dtype=autocast_dtype):
                 h_hat = bridge(llm_h.to(args.device), llm_mask.to(args.device))
                 loss = 0.0
                 if teacher is not None:
@@ -137,10 +148,15 @@ def main() -> None:
                     )
 
             optim.zero_grad(set_to_none=True)
-            scaler.scale(loss).backward()
-            torch.nn.utils.clip_grad_norm_(bridge.parameters(), 1.0)
-            scaler.step(optim)
-            scaler.update()
+            if scaler is not None:
+                scaler.scale(loss).backward()
+                torch.nn.utils.clip_grad_norm_(bridge.parameters(), 1.0)
+                scaler.step(optim)
+                scaler.update()
+            else:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(bridge.parameters(), 1.0)
+                optim.step()
 
             global_step += 1
             if global_step % args.log_every == 0:
