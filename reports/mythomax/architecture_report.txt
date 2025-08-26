@@ -1,0 +1,161 @@
+# MythoMax-L2-13B Architecture Report
+Model dir: /workspace/models/MythoMax-L2-13B
+
+[Config]
+{
+  "vocab_size": 32000,
+  "max_position_embeddings": 4096,
+  "hidden_size": 5120,
+  "intermediate_size": 13824,
+  "num_hidden_layers": 40,
+  "num_attention_heads": 40,
+  "num_key_value_heads": 40,
+  "hidden_act": "silu",
+  "initializer_range": 0.02,
+  "rms_norm_eps": 1e-05,
+  "pretraining_tp": 1,
+  "use_cache": true,
+  "rope_theta": 10000.0,
+  "rope_scaling": null,
+  "attention_bias": false,
+  "attention_dropout": 0.0,
+  "mlp_bias": false,
+  "head_dim": 128,
+  "return_dict": true,
+  "output_hidden_states": false,
+  "torchscript": false,
+  "torch_dtype": "float16",
+  "pruned_heads": {},
+  "tie_word_embeddings": false,
+  "chunk_size_feed_forward": 0,
+  "is_encoder_decoder": false,
+  "is_decoder": false,
+  "cross_attention_hidden_size": null,
+  "add_cross_attention": false,
+  "tie_encoder_decoder": false,
+  "architectures": [
+    "LlamaForCausalLM"
+  ],
+  "finetuning_task": null,
+  "id2label": {
+    "0": "LABEL_0",
+    "1": "LABEL_1"
+  },
+  "label2id": {
+    "LABEL_0": 0,
+    "LABEL_1": 1
+  },
+  "task_specific_params": null,
+  "problem_type": null,
+  "tokenizer_class": null,
+  "prefix": null,
+  "bos_token_id": 1,
+  "pad_token_id": 0,
+  "eos_token_id": 2,
+  "sep_token_id": null,
+  "decoder_start_token_id": null,
+  "max_length": 20,
+  "min_length": 0,
+  "do_sample": false,
+  "early_stopping": false,
+  "num_beams": 1,
+  "num_beam_groups": 1,
+  "diversity_penalty": 0.0,
+  "temperature": 1.0,
+  "top_k": 50,
+  "top_p": 1.0,
+  "typical_p": 1.0,
+  "repetition_penalty": 1.0,
+  "length_penalty": 1.0,
+  "no_repeat_ngram_size": 0,
+  "encoder_no_repeat_ngram_size": 0,
+  "bad_words_ids": null,
+  "num_return_sequences": 1,
+  "output_scores": false,
+  "return_dict_in_generate": false,
+  "forced_bos_token_id": null,
+  "forced_eos_token_id": null,
+  "remove_invalid_values": false,
+  "exponential_decay_length_penalty": null,
+  "suppress_tokens": null,
+  "begin_suppress_tokens": null,
+  "_name_or_path": "/workspace/models/MythoMax-L2-13B",
+  "transformers_version": "4.55.2",
+  "model_type": "llama",
+  "tf_legacy_loss": false,
+  "use_bfloat16": false,
+  "output_attentions": false
+}
+
+[Tokenizer]
+vocab_size=32000, bos=1, eos=2, pad=0
+tokenizer_class=LlamaTokenizerFast
+
+[LLaMA core]
+hidden_size=5120, num_hidden_layers=40, num_attention_heads=40, num_key_value_heads=40, head_dim=128, intermediate_size=13824, activation=silu, rms_norm_eps=1e-05
+rope_theta=10000.0, rope_scaling=None
+
+[Parameters]
+total_params: 13,015,864,320
+~memory (fp16): 24.24 GB, ~memory (bf16): 24.24 GB
+default/declared dtype: float16
+
+[By kind]
+mlp.gate_proj        2,831,155,200
+mlp.up_proj          2,831,155,200
+mlp.down_proj        2,831,155,200
+attn.q_proj          1,048,576,000
+attn.k_proj          1,048,576,000
+attn.v_proj          1,048,576,000
+attn.o_proj          1,048,576,000
+embeddings            163,840,000
+lm_head               163,840,000
+pre_attn_norm             204,800
+post_attn_norm            204,800
+other                       5,120
+
+[Per layer param counts]
+layer 00:  317,204,480
+layer 01:  317,204,480
+layer 02:  317,204,480
+layer 03:  317,204,480
+layer 04:  317,204,480
+layer 05:  317,204,480
+layer 06:  317,204,480
+layer 07:  317,204,480
+layer 08:  317,204,480
+layer 09:  317,204,480
+layer 10:  317,204,480
+layer 11:  317,204,480
+layer 12:  317,204,480
+layer 13:  317,204,480
+layer 14:  317,204,480
+layer 15:  317,204,480
+layer 16:  317,204,480
+layer 17:  317,204,480
+layer 18:  317,204,480
+layer 19:  317,204,480
+layer 20:  317,204,480
+layer 21:  317,204,480
+layer 22:  317,204,480
+layer 23:  317,204,480
+layer 24:  317,204,480
+layer 25:  317,204,480
+layer 26:  317,204,480
+layer 27:  317,204,480
+layer 28:  317,204,480
+layer 29:  317,204,480
+layer 30:  317,204,480
+layer 31:  317,204,480
+layer 32:  317,204,480
+layer 33:  317,204,480
+layer 34:  317,204,480
+layer 35:  317,204,480
+layer 36:  317,204,480
+layer 37:  317,204,480
+layer 38:  317,204,480
+layer 39:  317,204,480
+
+[Notes]
+- Keys/Shapes listed in tensor_index.csv
+- Module tree in module_tree.txt

@@ -16,11 +16,11 @@ class WanTextTeacher(torch.nn.Module):
 
     def __init__(
         self,
-        ckpt: str | Path = REPO_ROOT
+        ckpt: str | Path = Path("/workspace")
         / "models"
         / "Wan2.2-TI2V-5B"
         / "models_t5_umt5-xxl-enc-bf16.pth",
-        tok_dir: str | Path = REPO_ROOT
+        tok_dir: str | Path = Path("/workspace")
         / "models"
         / "Wan2.2-TI2V-5B"
         / "google"
