@@ -130,6 +130,8 @@ def export_peft_adapter(
     Export only LoRA tensors in a PEFT-compatible key format so existing loaders can consume it:
       diffusion_model.blocks.{i}.cross_attn.{k,v}.lora_A.weight
       diffusion_model.blocks.{i}.cross_attn.{k,v}.lora_B.weight
+
+    `prefix` should match what your inference loader expects (e.g., ``"transformer."``).
     """
     state: Dict[str, torch.Tensor] = {}
     for name, module in model.named_modules():
