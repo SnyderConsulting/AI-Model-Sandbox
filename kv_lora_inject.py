@@ -34,6 +34,11 @@ class LoRALinear(nn.Module):
             self.lora_B = nn.Linear(rank, self.out_features, bias=False)
             nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
             nn.init.zeros_(self.lora_B.weight)  # ensures initial delta ~ 0
+            # Place LoRA weights on the same device/dtype as the base projection
+            dev = base.weight.device
+            dtype = base.weight.dtype
+            self.lora_A.to(device=dev, dtype=dtype)
+            self.lora_B.to(device=dev, dtype=dtype)
         else:
             # Rank 0 -> disabled lora (for completeness)
             self.lora_A = None
@@ -46,7 +51,13 @@ class LoRALinear(nn.Module):
         y = self.base(x)
         if self.lora_A is None or not self.enabled:
             return y
-        return y + self.dropout(self.lora_B(self.lora_A(x))) * self.scaling
+        # Ensure input matches LoRA weight device/dtype (safe, small tensors)
+        if x.device != self.lora_A.weight.device or x.dtype != self.lora_A.weight.dtype:
+            x = x.to(device=self.lora_A.weight.device, dtype=self.lora_A.weight.dtype)
+        delta = self.lora_B(self.lora_A(x)) * self.scaling
+        if delta.dtype != y.dtype:
+            delta = delta.to(y.dtype)
+        return y + self.dropout(delta)
 
     @property
     def weight(self):
