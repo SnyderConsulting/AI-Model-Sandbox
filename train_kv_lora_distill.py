@@ -21,6 +21,7 @@ from typing import List, Tuple
 from datetime import datetime, timezone
 import shutil
 from tqdm import tqdm
+import time
 
 import torch
 from torch.optim import AdamW
@@ -330,6 +331,10 @@ def train(args: argparse.Namespace) -> None:
     params = lora_parameters(model)
     optim = AdamW(params, lr=args.lr, weight_decay=0.0)
 
+    ema = None
+    ema_beta = 0.98  # smoothing
+    last_print = time.perf_counter()
+
     for epoch in range(args.epochs):
         pbar = tqdm(loader, desc=f"epoch {epoch+1}/{args.epochs}", leave=True)
         for batch_prompts in pbar:
@@ -366,9 +371,31 @@ def train(args: argparse.Namespace) -> None:
             loss.backward()
             torch.nn.utils.clip_grad_norm_(params, 1.0)
             optim.step()
-            steps_total += 1
             # progress
             loss_val = float(loss.detach().item())
+            ema = (
+                (ema_beta * ema + (1 - ema_beta) * loss_val)
+                if ema is not None
+                else loss_val
+            )
+            steps_total += 1
+            if steps_total % 50 == 0:
+                now = time.perf_counter()
+                dt = now - last_print
+                it_per_s = 50.0 / max(dt, 1e-6)
+                last_print = now
+                # Tiny delta budget check
+                tot_sq, base_sq = 0.0, 0.0
+                with torch.no_grad():
+                    for m in model.modules():
+                        if hasattr(m, "base") and hasattr(m, "lora_A"):
+                            dW = (m.lora_B.weight @ m.lora_A.weight) * m.scaling
+                            tot_sq += float((dW**2).sum().item())
+                            base_sq += float((m.base.weight**2).sum().item())
+                delta_ratio = (tot_sq**0.5 / base_sq**0.5) if base_sq > 0 else 0.0
+                print(
+                    f"[{epoch+1}/{args.epochs}] step={steps_total} loss={loss_val:.1f} ema={ema:.1f} it/s={it_per_s:.2f} ΔW/W={delta_ratio:.3e}"
+                )
             pbar.set_postfix_str(f"loss={loss_val:.5f}")
             _append_progress(epoch=epoch + 1, step=steps_total, loss=loss_val)
 
@@ -381,6 +408,52 @@ def train(args: argparse.Namespace) -> None:
                 shutil.copy2(
                     ck_step, os.path.join(args.out_dir, "adapter_latest.safetensors")
                 )
+                print(f"[ckpt] wrote {ck_step}")
+                # Optional sampling
+                if (
+                    args.sample_every_steps > 0
+                    and args.sample_prompts_file
+                    and (steps_total % args.sample_every_steps == 0)
+                ):
+                    try:
+                        import subprocess
+                        import shlex
+
+                        with open(args.sample_prompts_file, "r", encoding="utf-8") as f:
+                            prompts = [ln.strip() for ln in f if ln.strip()][
+                                : args.sample_n
+                            ]
+                        samp_dir = os.path.join(
+                            args.out_dir, "sample", f"step_{steps_total:07d}"
+                        )
+                        os.makedirs(samp_dir, exist_ok=True)
+                        env = os.environ.copy()
+                        env["WAN_USE_BRIDGE"] = "1"
+                        env["WAN_BRIDGE_CKPT"] = args.bridge_ckpt
+                        env["WAN_BRIDGE_LLM_DIR"] = args.llm_dir
+                        env["WAN_BRIDGE_GLOBAL_SCALE"] = str(args.global_scale)
+                        gen = os.path.join(
+                            Path(__file__).parent,
+                            "inference",
+                            "Wan2.2",
+                            "generate.py",
+                        )
+                        for i, prompt in enumerate(prompts):
+                            cmd_base = (
+                                f'python "{gen}" --task {args.sample_task} --ckpt_dir "{args.transformer_weights_dir or os.path.dirname(args.transformer_weights)}" '
+                                f"--size {args.sample_size} --frame_num {args.sample_frame_num} --sample_steps {args.sample_steps} "
+                                f'--sample_guide_scale {args.sample_guide_scale} --base_seed {args.sample_seed} --prompt "{prompt}" '
+                                f'--save_file "{os.path.join(samp_dir, f"p{i:02d}_baseline.mp4")}"'
+                            )
+                            subprocess.run(shlex.split(cmd_base), env=env, check=False)
+                            cmd_lora = (
+                                cmd_base
+                                + f' --kv_lora_adapter "{ck_step}" --kv_lora_prefix {args.adapter_prefix} --kv_lora_alpha {args.alpha}'
+                            )
+                            cmd_lora = cmd_lora.replace("baseline.mp4", "lora.mp4")
+                            subprocess.run(shlex.split(cmd_lora), env=env, check=False)
+                    except Exception as e:
+                        print(f"[sample] failed to auto-sample: {e}")
 
         print(f"Epoch {epoch+1}/{args.epochs} - loss {loss.item():.4f}")
         # epoch checkpoint
@@ -501,6 +574,31 @@ def build_argparser() -> argparse.ArgumentParser:
         default=0,
         help="If >0, write adapter_step_*.safetensors every N steps.",
     )
+    # On-save sampling
+    p.add_argument(
+        "--sample_every_steps",
+        type=int,
+        default=0,
+        help="0=off; sample every N steps when a checkpoint is saved",
+    )
+    p.add_argument(
+        "--sample_prompts_file",
+        type=str,
+        default=None,
+        help="Text file of prompts; first K are used per sample",
+    )
+    p.add_argument(
+        "--sample_n",
+        type=int,
+        default=2,
+        help="How many prompts from the file to sample each time",
+    )
+    p.add_argument("--sample_task", type=str, default="ti2v-5B")
+    p.add_argument("--sample_size", type=str, default="1280*720")
+    p.add_argument("--sample_steps", type=int, default=50)
+    p.add_argument("--sample_guide_scale", type=float, default=5.5)
+    p.add_argument("--sample_frame_num", type=int, default=33)
+    p.add_argument("--sample_seed", type=int, default=12345)
     p.add_argument(
         "--save_every_epochs",
         type=int,

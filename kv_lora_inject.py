@@ -3,11 +3,11 @@
 # Works without PEFT; produces a PEFT-compatible state dict for adapter_model.safetensors.
 
 from __future__ import annotations
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, Iterable, List, Tuple, Optional
 
 import torch
 import torch.nn as nn
-from safetensors.torch import save_file as safetensors_save
+from safetensors.torch import save_file as safetensors_save, safe_open
 import math
 
 
@@ -153,3 +153,45 @@ def export_peft_adapter(
             state[key_A] = module.lora_A.weight.detach().cpu()
             state[key_B] = module.lora_B.weight.detach().cpu()
     safetensors_save(state, save_path, metadata={"format": "pt"})
+
+
+# ---------- RUNTIME LOADER ----------
+
+
+def _infer_rank_from_adapter(path: str, prefix: str = "diffusion_model.") -> int:
+    """Read one lora_A tensor to infer the LoRA rank."""
+    with safe_open(path, framework="pt", device="cpu") as f:
+        for k in f.keys():
+            if k.endswith(".lora_A.weight") and k.startswith(prefix):
+                # lora_A has shape [rank, in_features]
+                return int(f.get_tensor(k).shape[0])
+    raise RuntimeError("Could not infer LoRA rank from adapter file.")
+
+
+def load_peft_adapter(
+    model: nn.Module,
+    path: str,
+    prefix: str = "diffusion_model.",
+    alpha: float = 32.0,
+    dropout: float = 0.0,
+    blocks_range: Optional[Tuple[int, int]] = None,
+) -> Dict[str, LoRALinear]:
+    """
+    Inject KV LoRA into the model with the correct rank and load weights from `path`.
+    Returns: dict of injected modules, same keys as inject_lora_kv.
+    """
+
+    rank = _infer_rank_from_adapter(path, prefix=prefix)
+    loras = inject_lora_kv(
+        model, rank=rank, alpha=alpha, dropout=dropout, blocks_range=blocks_range
+    )
+    # load weights
+    with safe_open(path, framework="pt", device="cpu") as f:
+        for name, module in model.named_modules():
+            if isinstance(module, LoRALinear):
+                key_A = f"{prefix}{name}.lora_A.weight"
+                key_B = f"{prefix}{name}.lora_B.weight"
+                module.lora_A.weight.copy_(f.get_tensor(key_A))
+                module.lora_B.weight.copy_(f.get_tensor(key_B))
+                module.enabled = True
+    return loras
