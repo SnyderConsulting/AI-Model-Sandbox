@@ -21,7 +21,7 @@ from typing import List, Tuple
 import torch
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, Dataset
-from safetensors.torch import load_file
+from safetensors.torch import load_file, safe_open
 
 from kv_lora_inject import (
     export_peft_adapter,
@@ -95,11 +95,11 @@ def encode_teacher(
 
 def encode_bridge(
     prompts: List[str], encoder: BridgeEncoderModel, device: torch.device, max_len: int
-) -> torch.Tensor:
+) -> Tuple[torch.Tensor, torch.Tensor]:
     tokens = encoder(prompts, device)
-    # Bridge already returns fixed length tensors but pad just in case
-    padded, _ = pad_stack(tokens, max_len)
-    return padded
+    # Bridge returns variable-length lists; pad and return its own mask.
+    padded, mask = pad_stack(tokens, max_len)
+    return padded, mask
 
 
 # -----------------------------------------------------------------------------
@@ -123,6 +123,80 @@ def compute_kv(
     return k_list, v_list
 
 
+def _strip_prefix(k: str) -> str:
+    """Normalize pretrained keys: drop common prefixes to match WanModel attr names."""
+    for p in ("diffusion_model.", "transformer.", "model."):
+        if k.startswith(p):
+            return k[len(p) :]
+    return k
+
+
+def _needed_key(name: str) -> bool:
+    """We only need text_embedding and cross-attn K/V (& norms)."""
+    if name.startswith("text_embedding"):
+        return True
+    if ".cross_attn." in name:
+        # keep k, v, and q/k norms (q not strictly needed for this trainer but harmless)
+        return any(
+            sub in name
+            for sub in (
+                ".cross_attn.k",
+                ".cross_attn.v",
+                ".cross_attn.norm_k",
+                ".cross_attn.norm_q",
+            )
+        )
+    return False
+
+
+def _load_filtered_state(
+    weights_dir: str | None, weights_file: str | None
+) -> dict[str, torch.Tensor]:
+    """
+    Load only the tensors we need from Wan 5B sharded weights.
+    Accepts either a directory containing shards+index or a single .safetensors file.
+    """
+    state: dict[str, torch.Tensor] = {}
+    if weights_dir:
+        weights_dir = os.fspath(weights_dir)
+        # Prefer index if present, otherwise glob shards.
+        index_path = (
+            Path(weights_dir) / "diffusion_pytorch_model.safetensors.index.json"
+        )
+        shard_paths = []
+        if index_path.exists():
+            with open(index_path, "r", encoding="utf-8") as f:
+                idx = json.load(f)
+            # Collect only files referenced by needed keys
+            needed = set()
+            for k, fn in idx.get("weight_map", {}).items():
+                name = _strip_prefix(k)
+                if _needed_key(name):
+                    needed.add(fn)
+            shard_paths = sorted({os.path.join(weights_dir, fn) for fn in needed})
+        if not shard_paths:
+            shard_paths = sorted(
+                str(p)
+                for p in Path(weights_dir).glob("diffusion_pytorch_model-*.safetensors")
+            )
+        for sp in shard_paths:
+            with safe_open(sp, framework="pt", device="cpu") as f:
+                for k in f.keys():
+                    name = _strip_prefix(k)
+                    if _needed_key(name) and name not in state:
+                        state[name] = f.get_tensor(k)
+    else:
+        assert (
+            weights_file is not None
+        ), "Provide either --transformer_weights_dir or --transformer_weights"
+        sd = load_file(weights_file, device="cpu")
+        for k, v in sd.items():
+            name = _strip_prefix(k)
+            if _needed_key(name):
+                state[name] = v
+    return state
+
+
 # -----------------------------------------------------------------------------
 # Main training routine
 # -----------------------------------------------------------------------------
@@ -136,24 +210,41 @@ def train(args: argparse.Namespace) -> None:
         cfg = json.load(f)
     model = WanModel(**cfg).to(device)
 
-    # load only required weights
-    sd = load_file(args.transformer_weights)
-    filtered = {
-        k: v
-        for k, v in sd.items()
-        if k.startswith("text_embedding") or ".cross_attn." in k
-    }
-    model.load_state_dict(filtered, strict=False)
+    # Load sharded or single-file weights; keep only text_embed + cross_attn K/V (+ norms)
+    filtered = _load_filtered_state(
+        getattr(args, "transformer_weights_dir", None),
+        getattr(args, "transformer_weights", None),
+    )
+    missing, unexpected = model.load_state_dict(filtered, strict=False)
+    if unexpected:
+        print(
+            f"[warn] unexpected keys while loading filtered state: {len(unexpected)} (ignored)"
+        )
+    if missing:
+        # It's okay to miss non-text/cross-attn params; we never use them here.
+        print(f"[info] missing keys (not loaded): {len(missing)}")
     model.requires_grad_(False)
 
     # inject LoRA modules
-    inject_lora_kv(model, rank=args.rank, alpha=args.alpha)
+    loras = inject_lora_kv(model, rank=args.rank, alpha=args.alpha)
+    # Preflight: list injected modules
+    print(f"[lora] injected {len(loras)} modules:")
+    for name in sorted(loras.keys())[:4]:
+        print("   ", name)
+    if len(loras) > 4:
+        print("   ...")
 
     # --- encoders ---------------------------------------------------------
+    # robust text length getter
+    text_len = getattr(model, "config", None)
+    text_len = getattr(text_len, "text_len", None) if text_len is not None else None
+    if text_len is None:
+        text_len = getattr(model, "text_len", 512)
+
     teacher_enc = T5EncoderModel(
-        text_len=model.config.text_len,
+        text_len=text_len,
         checkpoint_path=args.t5_checkpoint,
-        tokenizer_path=args.t5_tokenizer,
+        tokenizer_path=args.t5_tokenizer_dir or args.t5_tokenizer,
         device=device,
         dtype=torch.bfloat16 if args.bf16 else torch.float32,
     )
@@ -163,7 +254,7 @@ def train(args: argparse.Namespace) -> None:
     os.environ["WAN_BRIDGE_LLM_DIR"] = args.llm_dir
     os.environ["WAN_BRIDGE_GLOBAL_SCALE"] = str(args.global_scale)
     bridge_enc = BridgeEncoderModel(
-        text_len=model.config.text_len,
+        text_len=text_len,
         device=device,
         dtype=torch.bfloat16 if args.bf16 else torch.float32,
     )
@@ -184,25 +275,27 @@ def train(args: argparse.Namespace) -> None:
             set_lora_enabled(model, False)
             with torch.no_grad():
                 teacher_tokens, mask = encode_teacher(
-                    batch_prompts, teacher_enc, device, model.config.text_len
+                    batch_prompts, teacher_enc, device, text_len
                 )
                 teacher_context = model.text_embedding(teacher_tokens.float())
                 k_t, v_t = compute_kv(model, teacher_context, args.use_normed_targets)
 
             # student pass (LoRA enabled)
             set_lora_enabled(model, True)
-            bridge_tokens = encode_bridge(
-                batch_prompts, bridge_enc, device, model.config.text_len
+            bridge_tokens, mask_bridge = encode_bridge(
+                batch_prompts, bridge_enc, device, text_len
             )
             bridge_context = model.text_embedding(bridge_tokens.float())
             k_s, v_s = compute_kv(model, bridge_context, args.use_normed_targets)
 
             # loss
             loss = torch.tensor(0.0, device=device)
+            # intersect masks (teacher & bridge) to avoid counting pad/trim mismatches
+            mask_inter = (mask > 0) & (mask_bridge > 0)
+            denom = mask_inter.sum().clamp_min(1.0)
             for kt, ks, vt, vs in zip(k_t, k_s, v_t, v_s):
-                mse_k = ((ks - kt) ** 2) * mask
-                mse_v = ((vs - vt) ** 2) * mask
-                denom = mask.sum().clamp_min(1.0)
+                mse_k = ((ks - kt) ** 2) * mask_inter
+                mse_v = ((vs - vt) ** 2) * mask_inter
                 loss = loss + mse_k.sum() / denom + mse_v.sum() / denom
 
             optim.zero_grad()
@@ -215,7 +308,10 @@ def train(args: argparse.Namespace) -> None:
     # save adapter
     Path(args.out_dir).mkdir(parents=True, exist_ok=True)
     out_path = os.path.join(args.out_dir, "adapter_model.safetensors")
-    export_peft_adapter(model, out_path)
+    # If your loader expects a different prefix, change it here (e.g., "transformer.")
+    export_peft_adapter(
+        model, out_path, prefix=getattr(args, "adapter_prefix", "diffusion_model.")
+    )
     print(f"Saved adapter to {out_path}")
 
 
@@ -225,9 +321,32 @@ def train(args: argparse.Namespace) -> None:
 def build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="KV LoRA distillation trainer")
     p.add_argument("--transformer_config", type=str, required=True)
-    p.add_argument("--transformer_weights", type=str, required=True)
+    # Accept either a directory with shards+index or a single .safetensors file
+    p.add_argument(
+        "--transformer_weights_dir",
+        type=str,
+        default=None,
+        help="Directory containing diffusion_pytorch_model-*.safetensors (Wan 5B).",
+    )
+    p.add_argument(
+        "--transformer_weights",
+        type=str,
+        default=None,
+        help="Single .safetensors file (optional if --transformer_weights_dir is set).",
+    )
     p.add_argument("--t5_checkpoint", type=str, required=True)
-    p.add_argument("--t5_tokenizer", type=str, required=True)
+    p.add_argument(
+        "--t5_tokenizer_dir",
+        type=str,
+        default=None,
+        help="Local tokenizer directory (preferred).",
+    )
+    p.add_argument(
+        "--t5_tokenizer",
+        type=str,
+        default=None,
+        help="HF name or path (fallback if *_dir not provided).",
+    )
     p.add_argument("--prompts_file", type=str, required=True)
     p.add_argument("--out_dir", type=str, required=True)
     p.add_argument("--bridge_ckpt", type=str, required=True)
@@ -241,6 +360,12 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--use_normed_targets", action="store_true")
     p.add_argument(
         "--bf16", action="store_true", help="Use bfloat16 precision for encoders"
+    )
+    p.add_argument(
+        "--adapter_prefix",
+        type=str,
+        default="diffusion_model.",
+        help="Key prefix when exporting LoRA adapter (e.g., diffusion_model. or transformer.)",
     )
     return p
 
