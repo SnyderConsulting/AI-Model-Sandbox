@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import random
 from pathlib import Path
 from typing import List, Tuple
 
@@ -49,11 +50,43 @@ from wan.modules.t5_bridge import BridgeEncoderModel  # type: ignore  # noqa: E4
 
 
 class PromptDataset(Dataset):
-    """Simple dataset reading prompts from a text file."""
+    """
+    Reads prompts from either a .txt (one per line) or a .jsonl with a text field.
+    Supports optional shuffle and max_samples for quick subsampling.
+    """
 
-    def __init__(self, path: str):
-        with open(path, "r", encoding="utf-8") as f:
-            self.prompts = [line.strip() for line in f.readlines() if line.strip()]
+    def __init__(
+        self,
+        path: str,
+        jsonl_field: str | None = None,
+        shuffle: bool = False,
+        max_samples: int | None = None,
+    ):
+        p = Path(path)
+        ex = p.suffix.lower()
+        prompts: list[str] = []
+        if ex == ".jsonl":
+            field = jsonl_field or "caption"
+            with open(p, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                        txt = obj.get(field, "")
+                        if isinstance(txt, str) and txt.strip():
+                            prompts.append(txt.strip())
+                    except Exception:
+                        continue
+        else:
+            with open(p, "r", encoding="utf-8") as f:
+                prompts = [ln.strip() for ln in f if ln.strip()]
+        if shuffle:
+            random.shuffle(prompts)
+        if max_samples is not None:
+            prompts = prompts[:max_samples]
+        self.prompts = prompts
 
     def __len__(self) -> int:  # pragma: no cover - trivial
         return len(self.prompts)
@@ -259,13 +292,27 @@ def train(args: argparse.Namespace) -> None:
         dtype=torch.bfloat16 if args.bf16 else torch.float32,
     )
 
-    dataset = PromptDataset(args.prompts_file)
+    dataset = PromptDataset(
+        args.prompts_file,
+        jsonl_field=args.jsonl_field,
+        shuffle=args.shuffle,
+        max_samples=args.max_samples,
+    )
     loader = DataLoader(
-        dataset, batch_size=args.batch_size, shuffle=True, drop_last=False
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        drop_last=False,
+        num_workers=min(4, os.cpu_count() or 1),
+        pin_memory=True,
+        persistent_workers=True,
     )
 
     params = lora_parameters(model)
     optim = AdamW(params, lr=args.lr, weight_decay=0.0)
+    accum = max(1, args.grad_accum)
+    optim.zero_grad()
+    step = 0
 
     for epoch in range(args.epochs):
         for batch_prompts in loader:
@@ -298,10 +345,12 @@ def train(args: argparse.Namespace) -> None:
                 mse_v = ((vs - vt) ** 2) * mask_inter
                 loss = loss + mse_k.sum() / denom + mse_v.sum() / denom
 
-            optim.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(params, 1.0)
-            optim.step()
+            (loss / accum).backward()
+            if step % accum == 0:
+                torch.nn.utils.clip_grad_norm_(params, 1.0)
+                optim.step()
+                optim.zero_grad()
+            step += 1
 
         print(f"Epoch {epoch+1}/{args.epochs} - loss {loss.item():.4f}")
 
@@ -348,6 +397,23 @@ def build_argparser() -> argparse.ArgumentParser:
         help="HF name or path (fallback if *_dir not provided).",
     )
     p.add_argument("--prompts_file", type=str, required=True)
+    p.add_argument(
+        "--jsonl_field",
+        type=str,
+        default="caption",
+        help="Field name for JSONL files (default: caption).",
+    )
+    p.add_argument(
+        "--max_samples",
+        type=int,
+        default=None,
+        help="Optional subsample cap for quick runs.",
+    )
+    p.add_argument(
+        "--shuffle",
+        action="store_true",
+        help="Shuffle prompts before subsampling.",
+    )
     p.add_argument("--out_dir", type=str, required=True)
     p.add_argument("--bridge_ckpt", type=str, required=True)
     p.add_argument("--llm_dir", type=str, required=True)
@@ -357,6 +423,12 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--epochs", type=int, default=1)
     p.add_argument("--batch_size", type=int, default=8)
+    p.add_argument(
+        "--grad_accum",
+        type=int,
+        default=1,
+        help="Gradient accumulation steps.",
+    )
     p.add_argument("--use_normed_targets", action="store_true")
     p.add_argument(
         "--bf16", action="store_true", help="Use bfloat16 precision for encoders"
