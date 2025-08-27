@@ -3,3 +3,9 @@
 /datasets
 /outputs
 *.pt
+*.png
+*.jpeg
+*.jpg
+*.mp4
+*.pth
+/reports
