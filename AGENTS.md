@@ -45,7 +45,7 @@ This document defines how humans and AI agents collaborate in **AI Model Sandbox
        import flash_attn  # noqa: F401
    except Exception:
        USE_ACCEL = False
-````
+   ```
 
 4. **Pip order (for CI/agents):**
 
