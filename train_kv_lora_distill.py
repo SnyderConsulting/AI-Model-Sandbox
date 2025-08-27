@@ -18,6 +18,9 @@ import os
 import random
 from pathlib import Path
 from typing import List, Tuple
+from datetime import datetime, timezone
+import shutil
+from tqdm import tqdm
 
 import torch
 from torch.optim import AdamW
@@ -239,6 +242,21 @@ def train(args: argparse.Namespace) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # --- load Wan model ---------------------------------------------------
+    # reports dir (AGENTS.md policy)
+    run_tag = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%M-%SZ")
+    reports_root = args.report_dir or f"reports/dit_lora_translator/{run_tag}"
+    Path(reports_root).mkdir(parents=True, exist_ok=True)
+    # persist run args
+    with open(os.path.join(reports_root, "run_args.json"), "w", encoding="utf-8") as f:
+        json.dump(vars(args), f, indent=2, sort_keys=True)
+    progress_path = os.path.join(reports_root, "progress.jsonl")
+
+    def _append_progress(**kv):
+        with open(progress_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(kv) + "\n")
+
+    steps_total = 0
+
     with open(args.transformer_config, "r", encoding="utf-8") as f:
         cfg = json.load(f)
     model = WanModel(**cfg).to(device)
@@ -261,6 +279,7 @@ def train(args: argparse.Namespace) -> None:
     # inject LoRA modules
     loras = inject_lora_kv(model, rank=args.rank, alpha=args.alpha)
     # Preflight: list injected modules
+    print(f"[reports] writing to: {reports_root}")
     print(f"[lora] injected {len(loras)} modules:")
     for name in sorted(loras.keys())[:4]:
         print("   ", name)
@@ -310,12 +329,10 @@ def train(args: argparse.Namespace) -> None:
 
     params = lora_parameters(model)
     optim = AdamW(params, lr=args.lr, weight_decay=0.0)
-    accum = max(1, args.grad_accum)
-    optim.zero_grad()
-    step = 0
 
     for epoch in range(args.epochs):
-        for batch_prompts in loader:
+        pbar = tqdm(loader, desc=f"epoch {epoch+1}/{args.epochs}", leave=True)
+        for batch_prompts in pbar:
             if isinstance(batch_prompts, tuple):
                 batch_prompts = list(batch_prompts)
             # teacher pass (LoRA disabled)
@@ -345,14 +362,36 @@ def train(args: argparse.Namespace) -> None:
                 mse_v = ((vs - vt) ** 2) * mask_inter
                 loss = loss + mse_k.sum() / denom + mse_v.sum() / denom
 
-            (loss / accum).backward()
-            if step % accum == 0:
-                torch.nn.utils.clip_grad_norm_(params, 1.0)
-                optim.step()
-                optim.zero_grad()
-            step += 1
+            optim.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(params, 1.0)
+            optim.step()
+            steps_total += 1
+            # progress
+            loss_val = float(loss.detach().item())
+            pbar.set_postfix_str(f"loss={loss_val:.5f}")
+            _append_progress(epoch=epoch + 1, step=steps_total, loss=loss_val)
+
+            # optional step checkpoint
+            if args.save_every_steps and (steps_total % args.save_every_steps == 0):
+                ck_step = os.path.join(
+                    args.out_dir, f"adapter_step_{steps_total:07d}.safetensors"
+                )
+                export_peft_adapter(model, ck_step, prefix=args.adapter_prefix)
+                shutil.copy2(
+                    ck_step, os.path.join(args.out_dir, "adapter_latest.safetensors")
+                )
 
         print(f"Epoch {epoch+1}/{args.epochs} - loss {loss.item():.4f}")
+        # epoch checkpoint
+        if args.save_every_epochs and ((epoch + 1) % args.save_every_epochs == 0):
+            ck_ep = os.path.join(
+                args.out_dir, f"adapter_epoch{epoch+1:02d}.safetensors"
+            )
+            export_peft_adapter(model, ck_ep, prefix=args.adapter_prefix)
+            shutil.copy2(
+                ck_ep, os.path.join(args.out_dir, "adapter_latest.safetensors")
+            )
 
     # save adapter
     Path(args.out_dir).mkdir(parents=True, exist_ok=True)
@@ -362,6 +401,23 @@ def train(args: argparse.Namespace) -> None:
         model, out_path, prefix=getattr(args, "adapter_prefix", "diffusion_model.")
     )
     print(f"Saved adapter to {out_path}")
+    # final summary
+    with open(os.path.join(reports_root, "summary.json"), "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "steps_total": steps_total,
+                "final_loss": float(loss.detach().item()),
+                "out_adapter": out_path,
+            },
+            f,
+            indent=2,
+        )
+    with open(os.path.join(reports_root, "report.md"), "w", encoding="utf-8") as f:
+        f.write("# KV‑LoRA Phase‑1 run\n\n")
+        f.write(f"- out_dir: `{args.out_dir}`\n")
+        f.write(f"- adapter: `{out_path}`\n")
+        f.write(f"- steps_total: `{steps_total}`\n")
+        f.write(f"- final_loss: `{float(loss.detach().item()):.6f}`\n")
 
 
 # -----------------------------------------------------------------------------
@@ -438,6 +494,26 @@ def build_argparser() -> argparse.ArgumentParser:
         type=str,
         default="diffusion_model.",
         help="Key prefix when exporting LoRA adapter (e.g., diffusion_model. or transformer.)",
+    )
+    p.add_argument(
+        "--save_every_steps",
+        type=int,
+        default=0,
+        help="If >0, write adapter_step_*.safetensors every N steps.",
+    )
+    p.add_argument(
+        "--save_every_epochs",
+        type=int,
+        default=1,
+        help="Write adapter_epoch*.safetensors every N epochs (0 to disable).",
+    )
+    p.add_argument(
+        "--report_dir",
+        type=str,
+        default=None,
+        help=(
+            "Optional path for reports/; defaults to reports/dit_lora_translator/<timestamp>."
+        ),
     )
     return p
 
