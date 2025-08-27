@@ -1,11 +1,71 @@
-*/__pycache__
-*/*/__pycache__
-/datasets
-/outputs
+# ---------------------------------------
+# Python build & bytecode
+# ---------------------------------------
+__pycache__/
+**/__pycache__/
+*.py[cod]
+
+# ---------------------------------------
+# Project: generated data & artifacts (root-level)
+# ---------------------------------------
+/datasets/
+/outputs/
+/reports/
+/eval_runs/
+/cache/
+.cache/
+
+# ---------------------------------------
+# Inference/Wan2.2 generated artifacts (ANY depth)
+# ---------------------------------------
+inference/**/benchmark/
+inference/**/diagnostics/
+inference/**/manifests/
+inference/**/eval_runs/
+inference/**/reports/
+
+# If you keep sample media only locally:
+inference/Wan2.2/examples/
+
+# ---------------------------------------
+# Large/binary artifacts anywhere
+# (extensions — add/remove to taste)
+# ---------------------------------------
 *.pt
-*.png
-*.jpeg
-*.jpg
-*.mp4
 *.pth
-/reports
+*.ckpt
+*.safetensors
+*.bin
+*.onnx
+*.npy
+*.npz
+*.mp4
+*.MP4
+*.mov
+*.avi
+*.gif
+*.GIF
+*.webp
+*.WEBP
+*.png
+*.PNG
+*.jpg
+*.JPG
+*.jpeg
+*.JPEG
+*.mp3
+*.MP3
+*.wav
+*.WAV
+*.flac
+*.zip
+*.tar
+*.tar.gz
+*.gz
+
+# ---------------------------------------
+# Logs / debug outputs
+# ---------------------------------------
+*.log
+wandb/
+logs/
