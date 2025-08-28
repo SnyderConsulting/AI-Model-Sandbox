@@ -10,10 +10,11 @@ import random
 # Allow running without PYTHONPATH set to repo root
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 try:
-    from kv_lora_inject import inject_lora_kv, load_peft_adapter
+    from kv_lora_inject import inject_lora_kv, load_peft_adapter, LoRALinear
 except Exception:
     inject_lora_kv = None
     load_peft_adapter = None
+    LoRALinear = None
 
 import torch
 import torch.distributed as dist
@@ -423,6 +424,16 @@ def generate(args):
             convert_model_dtype=args.convert_model_dtype,
         )
         _maybe_load_kv_lora(wan_t2v, args, logging)
+        if args.lora_adapter_path and LoRALinear is not None:
+            target = (
+                getattr(wan_t2v, "model", None)
+                or getattr(wan_t2v, "dit", None)
+                or wan_t2v
+            )
+            n = sum(1 for _ in target.modules() if isinstance(_, LoRALinear))
+            logging.info(
+                f"KV-LoRA active: {n} modules (alpha={args.lora_alpha}, prefix={args.lora_prefix})"
+            )
 
         logging.info("Generating video ...")
         video = wan_t2v.generate(
@@ -450,6 +461,16 @@ def generate(args):
             convert_model_dtype=args.convert_model_dtype,
         )
         _maybe_load_kv_lora(wan_ti2v, args, logging)
+        if args.lora_adapter_path and LoRALinear is not None:
+            target = (
+                getattr(wan_ti2v, "model", None)
+                or getattr(wan_ti2v, "dit", None)
+                or wan_ti2v
+            )
+            n = sum(1 for _ in target.modules() if isinstance(_, LoRALinear))
+            logging.info(
+                f"KV-LoRA active: {n} modules (alpha={args.lora_alpha}, prefix={args.lora_prefix})"
+            )
 
         logging.info("Generating video ...")
         video = wan_ti2v.generate(
@@ -479,6 +500,16 @@ def generate(args):
             convert_model_dtype=args.convert_model_dtype,
         )
         _maybe_load_kv_lora(wan_s2v, args, logging)
+        if args.lora_adapter_path and LoRALinear is not None:
+            target = (
+                getattr(wan_s2v, "model", None)
+                or getattr(wan_s2v, "dit", None)
+                or wan_s2v
+            )
+            n = sum(1 for _ in target.modules() if isinstance(_, LoRALinear))
+            logging.info(
+                f"KV-LoRA active: {n} modules (alpha={args.lora_alpha}, prefix={args.lora_prefix})"
+            )
         logging.info("Generating video ...")
         video = wan_s2v.generate(
             input_prompt=args.prompt,
@@ -511,6 +542,16 @@ def generate(args):
             convert_model_dtype=args.convert_model_dtype,
         )
         _maybe_load_kv_lora(wan_i2v, args, logging)
+        if args.lora_adapter_path and LoRALinear is not None:
+            target = (
+                getattr(wan_i2v, "model", None)
+                or getattr(wan_i2v, "dit", None)
+                or wan_i2v
+            )
+            n = sum(1 for _ in target.modules() if isinstance(_, LoRALinear))
+            logging.info(
+                f"KV-LoRA active: {n} modules (alpha={args.lora_alpha}, prefix={args.lora_prefix})"
+            )
 
         logging.info("Generating video ...")
         video = wan_i2v.generate(
