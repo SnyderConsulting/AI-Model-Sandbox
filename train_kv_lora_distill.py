@@ -23,6 +23,7 @@ from datetime import datetime, timezone
 import shutil
 from tqdm import tqdm
 import time
+import gc
 
 import torch
 from torch.optim import AdamW
@@ -253,6 +254,55 @@ def _parse_step_from_filename(path: str) -> int:
     return int(m.group(1)) if m else 0
 
 
+def _release_training_gpu(objs: list[object]):
+    for o in objs:
+        try:
+            getattr(o, "to", lambda *_args, **_kw: None)("cpu")
+        except Exception:
+            pass
+    del objs[:]
+    torch.cuda.empty_cache()
+    gc.collect()
+
+
+def _rebuild_training(cfg, args):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    from wan.modules.model import WanModel
+
+    model = WanModel(**cfg).to(device)
+    filtered = _load_filtered_state(
+        getattr(args, "transformer_weights_dir", None),
+        getattr(args, "transformer_weights", None),
+    )
+    model.load_state_dict(filtered, strict=False)
+    model.requires_grad_(False)
+    _ = inject_lora_kv(model, rank=args.rank, alpha=args.alpha)
+    from glob import glob
+
+    latest = sorted(glob(os.path.join(args.out_dir, "adapter_step_*.safetensors")))[-1]
+    load_peft_adapter(model, path=latest, prefix=args.adapter_prefix, alpha=args.alpha)
+    params = lora_parameters(model)
+    optim = AdamW(params, lr=args.lr, weight_decay=0.0)
+    opt_latest = sorted(glob(os.path.join(args.out_dir, "optimizer_step_*.pt")))[-1]
+    state = torch.load(opt_latest, map_location="cpu")
+    optim.load_state_dict(state.get("state_dict", state))
+    enc_device = torch.device("cpu")
+    enc_dtype = torch.float32
+    teacher_enc = T5EncoderModel(
+        text_len=getattr(model, "text_len", 512),
+        checkpoint_path=args.t5_checkpoint,
+        tokenizer_path=args.t5_tokenizer_dir or args.t5_tokenizer,
+        device=enc_device,
+        dtype=enc_dtype,
+    )
+    bridge_enc = BridgeEncoderModel(
+        text_len=getattr(model, "text_len", 512),
+        device=enc_device,
+        dtype=enc_dtype,
+    )
+    return model, teacher_enc, bridge_enc, optim
+
+
 # -----------------------------------------------------------------------------
 # Main training routine
 # -----------------------------------------------------------------------------
@@ -260,6 +310,14 @@ def _parse_step_from_filename(path: str) -> int:
 
 def train(args: argparse.Namespace) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    enc_device = torch.device(
+        args.enc_device
+        if args.enc_device == "cpu" or torch.cuda.is_available()
+        else "cpu"
+    )
+    enc_dtype = (
+        torch.bfloat16 if (args.bf16 and enc_device.type == "cuda") else torch.float32
+    )
 
     # --- load Wan model ---------------------------------------------------
     # reports dir (AGENTS.md policy)
@@ -357,12 +415,14 @@ def train(args: argparse.Namespace) -> None:
         env["WAN_BRIDGE_CKPT"] = args.bridge_ckpt
         env["WAN_BRIDGE_LLM_DIR"] = args.llm_dir
         env["WAN_BRIDGE_GLOBAL_SCALE"] = str(args.global_scale)
+        env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
         gen = os.path.join(Path(__file__).parent, "inference", "Wan2.2", "generate.py")
         base = (
             f'python "{gen}" --task {args.sample_task} '
             f'--ckpt_dir "{args.transformer_weights_dir or os.path.dirname(args.transformer_weights)}" '
             f"--size {args.sample_size} --frame_num {args.sample_frame_num} "
             f"--sample_steps {args.sample_steps} --sample_guide_scale {args.sample_guide_scale} "
+            f"--t5_cpu --offload_model True "
             f"--base_seed {args.sample_seed}"
         )
         try:
@@ -382,8 +442,8 @@ def train(args: argparse.Namespace) -> None:
         text_len=text_len,
         checkpoint_path=args.t5_checkpoint,
         tokenizer_path=args.t5_tokenizer_dir or args.t5_tokenizer,
-        device=device,
-        dtype=torch.bfloat16 if args.bf16 else torch.float32,
+        device=enc_device,
+        dtype=enc_dtype,
     )
 
     # bridge env variables
@@ -392,9 +452,10 @@ def train(args: argparse.Namespace) -> None:
     os.environ["WAN_BRIDGE_GLOBAL_SCALE"] = str(args.global_scale)
     bridge_enc = BridgeEncoderModel(
         text_len=text_len,
-        device=device,
-        dtype=torch.bfloat16 if args.bf16 else torch.float32,
+        device=enc_device,
+        dtype=enc_dtype,
     )
+    print(f"[enc] teacher on {enc_device}, bridge on {enc_device}")
 
     dataset = PromptDataset(
         args.prompts_file,
@@ -414,6 +475,7 @@ def train(args: argparse.Namespace) -> None:
 
     params = lora_parameters(model)
     optim = AdamW(params, lr=args.lr, weight_decay=0.0)
+    optim.zero_grad(set_to_none=True)
     # Optionally resume optimizer
     if args.resume_optimizer and os.path.exists(args.resume_optimizer):
         state = torch.load(args.resume_optimizer, map_location="cpu")
@@ -441,16 +503,20 @@ def train(args: argparse.Namespace) -> None:
             set_lora_enabled(model, False)
             with torch.no_grad():
                 teacher_tokens, mask = encode_teacher(
-                    batch_prompts, teacher_enc, device, text_len
+                    batch_prompts, teacher_enc, enc_device, text_len
                 )
+                teacher_tokens = teacher_tokens.to(device)
+                mask = mask.to(device)
                 teacher_context = model.text_embedding(teacher_tokens.float())
                 k_t, v_t = compute_kv(model, teacher_context, args.use_normed_targets)
 
             # student pass (LoRA enabled)
             set_lora_enabled(model, True)
             bridge_tokens, mask_bridge = encode_bridge(
-                batch_prompts, bridge_enc, device, text_len
+                batch_prompts, bridge_enc, enc_device, text_len
             )
+            bridge_tokens = bridge_tokens.to(device)
+            mask_bridge = mask_bridge.to(device)
             bridge_context = model.text_embedding(bridge_tokens.float())
             k_s, v_s = compute_kv(model, bridge_context, args.use_normed_targets)
 
@@ -464,12 +530,16 @@ def train(args: argparse.Namespace) -> None:
                 mse_v = ((vs - vt) ** 2) * mask_inter
                 loss = loss + mse_k.sum() / denom + mse_v.sum() / denom
 
-            optim.zero_grad()
+            loss_raw = loss
+            loss = loss / args.grad_accum
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(params, 1.0)
-            optim.step()
+            if ((steps_total + 1) % args.grad_accum) == 0:
+                torch.nn.utils.clip_grad_norm_(params, 1.0)
+                optim.step()
+                optim.zero_grad(set_to_none=True)
             # progress
-            loss_val = float(loss.detach().item())
+            loss_val = float(loss_raw.detach().item())
+            loss = loss_raw
             ema = (
                 (ema_beta * ema + (1 - ema_beta) * loss_val)
                 if ema is not None
@@ -533,6 +603,7 @@ def train(args: argparse.Namespace) -> None:
                         env["WAN_BRIDGE_CKPT"] = args.bridge_ckpt
                         env["WAN_BRIDGE_LLM_DIR"] = args.llm_dir
                         env["WAN_BRIDGE_GLOBAL_SCALE"] = str(args.global_scale)
+                        env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
                         gen = os.path.join(
                             Path(__file__).parent,
                             "inference",
@@ -544,9 +615,23 @@ def train(args: argparse.Namespace) -> None:
                             f'--ckpt_dir "{args.transformer_weights_dir or os.path.dirname(args.transformer_weights)}" '
                             f"--size {args.sample_size} --frame_num {args.sample_frame_num} "
                             f"--sample_steps {args.sample_steps} --sample_guide_scale {args.sample_guide_scale} "
+                            f"--t5_cpu --offload_model True "
                             f"--base_seed {args.sample_seed}"
                         )
-                        _run_sampler_batch(gen, prompts, samp_dir, base, ck_step, env)
+                        if args.sample_pause_training:
+                            _release_training_gpu(
+                                [model, teacher_enc, bridge_enc, optim]
+                            )
+                        try:
+                            _run_sampler_batch(
+                                gen, prompts, samp_dir, base, ck_step, env
+                            )
+                        finally:
+                            if args.sample_pause_training:
+                                model, teacher_enc, bridge_enc, optim = (
+                                    _rebuild_training(cfg, args)
+                                )
+                                optim.zero_grad(set_to_none=True)
                     except Exception as e:
                         print(f"[sample] failed to auto-sample: {e}")
 
@@ -659,6 +744,13 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument(
         "--bf16", action="store_true", help="Use bfloat16 precision for encoders"
     )
+    p.add_argument(
+        "--enc_device",
+        type=str,
+        default="cpu",
+        choices=["cpu", "cuda"],
+        help="Device for T5 teacher/Bridge encoders (CPU saves a lot of VRAM).",
+    )
     # Resume options
     p.add_argument(
         "--resume_adapter",
@@ -716,11 +808,16 @@ def build_argparser() -> argparse.ArgumentParser:
         help="How many prompts from the file to sample each time",
     )
     p.add_argument("--sample_task", type=str, default="ti2v-5B")
-    p.add_argument("--sample_size", type=str, default="1280*720")
-    p.add_argument("--sample_steps", type=int, default=50)
+    p.add_argument("--sample_size", type=str, default="768*432")
+    p.add_argument("--sample_steps", type=int, default=20)
     p.add_argument("--sample_guide_scale", type=float, default=5.5)
-    p.add_argument("--sample_frame_num", type=int, default=33)
+    p.add_argument("--sample_frame_num", type=int, default=17)
     p.add_argument("--sample_seed", type=int, default=12345)
+    p.add_argument(
+        "--sample_pause_training",
+        action="store_true",
+        help="Free GPU before sampling (delete models/optimizer), then rebuild after.",
+    )
     p.add_argument(
         "--save_every_epochs",
         type=int,

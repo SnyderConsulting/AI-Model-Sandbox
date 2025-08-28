@@ -10,7 +10,6 @@ from contextlib import contextmanager
 from functools import partial
 
 import torch
-import torch.cuda.amp as amp
 import torch.distributed as dist
 from tqdm import tqdm
 
@@ -86,35 +85,41 @@ class WanT2V:
         self.text_encoder = T5EncoderModel(
             text_len=config.text_len,
             dtype=config.t5_dtype,
-            device=torch.device('cpu'),
+            device=torch.device("cpu"),
             checkpoint_path=os.path.join(checkpoint_dir, config.t5_checkpoint),
             tokenizer_path=os.path.join(checkpoint_dir, config.t5_tokenizer),
-            shard_fn=shard_fn if t5_fsdp else None)
+            shard_fn=shard_fn if t5_fsdp else None,
+        )
 
         self.vae_stride = config.vae_stride
         self.patch_size = config.patch_size
         self.vae = Wan2_1_VAE(
             vae_pth=os.path.join(checkpoint_dir, config.vae_checkpoint),
-            device=self.device)
+            device=self.device,
+        )
 
         logging.info(f"Creating WanModel from {checkpoint_dir}")
         self.low_noise_model = WanModel.from_pretrained(
-            checkpoint_dir, subfolder=config.low_noise_checkpoint)
+            checkpoint_dir, subfolder=config.low_noise_checkpoint
+        )
         self.low_noise_model = self._configure_model(
             model=self.low_noise_model,
             use_sp=use_sp,
             dit_fsdp=dit_fsdp,
             shard_fn=shard_fn,
-            convert_model_dtype=convert_model_dtype)
+            convert_model_dtype=convert_model_dtype,
+        )
 
         self.high_noise_model = WanModel.from_pretrained(
-            checkpoint_dir, subfolder=config.high_noise_checkpoint)
+            checkpoint_dir, subfolder=config.high_noise_checkpoint
+        )
         self.high_noise_model = self._configure_model(
             model=self.high_noise_model,
             use_sp=use_sp,
             dit_fsdp=dit_fsdp,
             shard_fn=shard_fn,
-            convert_model_dtype=convert_model_dtype)
+            convert_model_dtype=convert_model_dtype,
+        )
         if use_sp:
             self.sp_size = get_world_size()
         else:
@@ -122,8 +127,7 @@ class WanT2V:
 
         self.sample_neg_prompt = config.sample_neg_prompt
 
-    def _configure_model(self, model, use_sp, dit_fsdp, shard_fn,
-                         convert_model_dtype):
+    def _configure_model(self, model, use_sp, dit_fsdp, shard_fn, convert_model_dtype):
         """
         Configures a model object. This includes setting evaluation modes,
         applying distributed parallel strategy, and handling device placement.
@@ -150,7 +154,8 @@ class WanT2V:
         if use_sp:
             for block in model.blocks:
                 block.self_attn.forward = types.MethodType(
-                    sp_attn_forward, block.self_attn)
+                    sp_attn_forward, block.self_attn
+                )
             model.forward = types.MethodType(sp_dit_forward, model)
 
         if dist.is_initialized():
@@ -184,33 +189,37 @@ class WanT2V:
                 The active model on the target device for the current timestep.
         """
         if t.item() >= boundary:
-            required_model_name = 'high_noise_model'
-            offload_model_name = 'low_noise_model'
+            required_model_name = "high_noise_model"
+            offload_model_name = "low_noise_model"
         else:
-            required_model_name = 'low_noise_model'
-            offload_model_name = 'high_noise_model'
+            required_model_name = "low_noise_model"
+            offload_model_name = "high_noise_model"
         if offload_model or self.init_on_cpu:
-            if next(getattr(
-                    self,
-                    offload_model_name).parameters()).device.type == 'cuda':
-                getattr(self, offload_model_name).to('cpu')
-            if next(getattr(
-                    self,
-                    required_model_name).parameters()).device.type == 'cpu':
+            if (
+                next(getattr(self, offload_model_name).parameters()).device.type
+                == "cuda"
+            ):
+                getattr(self, offload_model_name).to("cpu")
+            if (
+                next(getattr(self, required_model_name).parameters()).device.type
+                == "cpu"
+            ):
                 getattr(self, required_model_name).to(self.device)
         return getattr(self, required_model_name)
 
-    def generate(self,
-                 input_prompt,
-                 size=(1280, 720),
-                 frame_num=81,
-                 shift=5.0,
-                 sample_solver='unipc',
-                 sampling_steps=50,
-                 guide_scale=5.0,
-                 n_prompt="",
-                 seed=-1,
-                 offload_model=True):
+    def generate(
+        self,
+        input_prompt,
+        size=(1280, 720),
+        frame_num=81,
+        shift=5.0,
+        sample_solver="unipc",
+        sampling_steps=50,
+        guide_scale=5.0,
+        n_prompt="",
+        seed=-1,
+        offload_model=True,
+    ):
         r"""
         Generates video frames from text prompt using diffusion process.
 
@@ -247,16 +256,28 @@ class WanT2V:
                 - W: Frame width from size)
         """
         # preprocess
-        guide_scale = (guide_scale, guide_scale) if isinstance(
-            guide_scale, float) else guide_scale
+        guide_scale = (
+            (guide_scale, guide_scale)
+            if isinstance(guide_scale, float)
+            else guide_scale
+        )
         F = frame_num
-        target_shape = (self.vae.model.z_dim, (F - 1) // self.vae_stride[0] + 1,
-                        size[1] // self.vae_stride[1],
-                        size[0] // self.vae_stride[2])
+        target_shape = (
+            self.vae.model.z_dim,
+            (F - 1) // self.vae_stride[0] + 1,
+            size[1] // self.vae_stride[1],
+            size[0] // self.vae_stride[2],
+        )
 
-        seq_len = math.ceil((target_shape[2] * target_shape[3]) /
-                            (self.patch_size[1] * self.patch_size[2]) *
-                            target_shape[1] / self.sp_size) * self.sp_size
+        seq_len = (
+            math.ceil(
+                (target_shape[2] * target_shape[3])
+                / (self.patch_size[1] * self.patch_size[2])
+                * target_shape[1]
+                / self.sp_size
+            )
+            * self.sp_size
+        )
 
         if n_prompt == "":
             n_prompt = self.sample_neg_prompt
@@ -264,17 +285,22 @@ class WanT2V:
         seed_g = torch.Generator(device=self.device)
         seed_g.manual_seed(seed)
 
-        if not self.t5_cpu:
+        # Honor CPU text-encoder when requested to save VRAM
+        if getattr(self, "t5_cpu", False):
+            try:
+                self.text_encoder.model.to("cpu")
+            except AttributeError:
+                pass
+            context = self.text_encoder([input_prompt], torch.device("cpu"))
+            context_null = self.text_encoder([n_prompt], torch.device("cpu"))
+            context = [t.to(self.device) for t in context]
+            context_null = [t.to(self.device) for t in context_null]
+        else:
             self.text_encoder.model.to(self.device)
             context = self.text_encoder([input_prompt], self.device)
             context_null = self.text_encoder([n_prompt], self.device)
             if offload_model:
                 self.text_encoder.model.cpu()
-        else:
-            context = self.text_encoder([input_prompt], torch.device('cpu'))
-            context_null = self.text_encoder([n_prompt], torch.device('cpu'))
-            context = [t.to(self.device) for t in context]
-            context_null = [t.to(self.device) for t in context_null]
 
         noise = [
             torch.randn(
@@ -284,53 +310,54 @@ class WanT2V:
                 target_shape[3],
                 dtype=torch.float32,
                 device=self.device,
-                generator=seed_g)
+                generator=seed_g,
+            )
         ]
 
         @contextmanager
         def noop_no_sync():
             yield
 
-        no_sync_low_noise = getattr(self.low_noise_model, 'no_sync',
-                                    noop_no_sync)
-        no_sync_high_noise = getattr(self.high_noise_model, 'no_sync',
-                                     noop_no_sync)
+        no_sync_low_noise = getattr(self.low_noise_model, "no_sync", noop_no_sync)
+        no_sync_high_noise = getattr(self.high_noise_model, "no_sync", noop_no_sync)
 
         # evaluation mode
         with (
-                torch.amp.autocast('cuda', dtype=self.param_dtype),
-                torch.no_grad(),
-                no_sync_low_noise(),
-                no_sync_high_noise(),
+            torch.amp.autocast("cuda", dtype=self.param_dtype),
+            torch.no_grad(),
+            no_sync_low_noise(),
+            no_sync_high_noise(),
         ):
             boundary = self.boundary * self.num_train_timesteps
 
-            if sample_solver == 'unipc':
+            if sample_solver == "unipc":
                 sample_scheduler = FlowUniPCMultistepScheduler(
                     num_train_timesteps=self.num_train_timesteps,
                     shift=1,
-                    use_dynamic_shifting=False)
+                    use_dynamic_shifting=False,
+                )
                 sample_scheduler.set_timesteps(
-                    sampling_steps, device=self.device, shift=shift)
+                    sampling_steps, device=self.device, shift=shift
+                )
                 timesteps = sample_scheduler.timesteps
-            elif sample_solver == 'dpm++':
+            elif sample_solver == "dpm++":
                 sample_scheduler = FlowDPMSolverMultistepScheduler(
                     num_train_timesteps=self.num_train_timesteps,
                     shift=1,
-                    use_dynamic_shifting=False)
+                    use_dynamic_shifting=False,
+                )
                 sampling_sigmas = get_sampling_sigmas(sampling_steps, shift)
                 timesteps, _ = retrieve_timesteps(
-                    sample_scheduler,
-                    device=self.device,
-                    sigmas=sampling_sigmas)
+                    sample_scheduler, device=self.device, sigmas=sampling_sigmas
+                )
             else:
                 raise NotImplementedError("Unsupported solver.")
 
             # sample videos
             latents = noise
 
-            arg_c = {'context': context, 'seq_len': seq_len}
-            arg_null = {'context': context_null, 'seq_len': seq_len}
+            arg_c = {"context": context, "seq_len": seq_len}
+            arg_null = {"context": context_null, "seq_len": seq_len}
 
             for _, t in enumerate(tqdm(timesteps)):
                 latent_model_input = latents
@@ -338,25 +365,25 @@ class WanT2V:
 
                 timestep = torch.stack(timestep)
 
-                model = self._prepare_model_for_timestep(
-                    t, boundary, offload_model)
-                sample_guide_scale = guide_scale[1] if t.item(
-                ) >= boundary else guide_scale[0]
+                model = self._prepare_model_for_timestep(t, boundary, offload_model)
+                sample_guide_scale = (
+                    guide_scale[1] if t.item() >= boundary else guide_scale[0]
+                )
 
-                noise_pred_cond = model(
-                    latent_model_input, t=timestep, **arg_c)[0]
-                noise_pred_uncond = model(
-                    latent_model_input, t=timestep, **arg_null)[0]
+                noise_pred_cond = model(latent_model_input, t=timestep, **arg_c)[0]
+                noise_pred_uncond = model(latent_model_input, t=timestep, **arg_null)[0]
 
                 noise_pred = noise_pred_uncond + sample_guide_scale * (
-                    noise_pred_cond - noise_pred_uncond)
+                    noise_pred_cond - noise_pred_uncond
+                )
 
                 temp_x0 = sample_scheduler.step(
                     noise_pred.unsqueeze(0),
                     t,
                     latents[0].unsqueeze(0),
                     return_dict=False,
-                    generator=seed_g)[0]
+                    generator=seed_g,
+                )[0]
                 latents = [temp_x0.squeeze(0)]
 
             x0 = latents
