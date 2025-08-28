@@ -4,8 +4,9 @@ prompt_probe_goonsai.py — quick probe for Goonsai Qwen2.5 NSFW prompt writer
 
 What it does
 ------------
-- Expands short "ideas" into CivitAI/Stable‑Diffusion style prompts via Ollama:
-    goonsai/qwen2.5-3B-goonsai-nsfw-100k
+- Expands short "ideas" into CivitAI/Stable‑Diffusion style prompts via
+  HuggingFace Transformers:
+    goonsai-com/civitaiprompts/qwen2.5-3B-goonsai-nsfw-100k
 - Scores generations with simple, diffusion-relevant text features:
     • token count
     • photography/camera/lighting lexicon hits
@@ -15,14 +16,11 @@ What it does
 - Saves CSV/JSON results and a small aggregate table (means per run).
 - Can sample your JSONL dataset (key='caption') to use *your* domain text as seeds.
 - Can auto-build a domain NSFW lexicon from your JSONL sample for better scoring.
-- Works with `ollama run` if the CLI is present, or falls back to HTTP POST
-  to `OLLAMA_HOST:/api/generate` if not.
 
 Prereqs
 -------
-- Install and run Ollama with the Goonsai model pulled locally:
-    ollama pull goonsai/qwen2.5-3B-goonsai-nsfw-100k
-  (If using a remote Ollama server, set OLLAMA_HOST accordingly.)
+- Requires `transformers>=4.53.0` and the Goonsai model downloaded from
+  HuggingFace.
 
 Examples
 --------
@@ -50,27 +48,23 @@ Outputs (default /tmp/prompt_probe_goonsai):
 Notes
 -----
 - This script is content-agnostic but assumes *adult* NSFW data. Ensure your data is 18+.
-- If both CLI and HTTP calls fail, the script records an [ERROR ...] string in
-  the generation field.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import os
 import random
 import re
-import shutil
-import subprocess
 import time
-import urllib.request
 from collections import Counter
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 # ------------------------- lexicons -------------------------
 
@@ -378,8 +372,15 @@ def build_lexicon_from_jsonl(
     return out_path
 
 
-def call_ollama(
-    model: str, idea: str, max_new_tokens: int = 240, temperature: float = 0.4
+# ------------------------- generation -------------------------
+
+
+def expand(
+    tok: AutoTokenizer,
+    model: AutoModelForCausalLM,
+    idea: str,
+    max_new_tokens: int = 240,
+    temperature: float = 0.4,
 ) -> str:
     sys_prompt = (
         "You are a prompt engineer for diffusion/video models. "
@@ -387,42 +388,22 @@ def call_ollama(
         "quality tags, subject, anatomy (if relevant), pose/action, setting, lighting, camera/lens, "
         "technical specs. End with an optional 'Negative prompt:' line. Use comma‑separated phrases."
     )
-    payload = f"{sys_prompt}\n\nIdea: {idea}\nPrompt:"
-
-    if shutil.which("ollama"):
-        try:
-            proc = subprocess.run(
-                ["ollama", "run", model],
-                input=payload,
-                text=True,
-                capture_output=True,
-                check=True,
-            )
-            return proc.stdout.strip()
-        except Exception as e:
-            return f"[ERROR calling ollama CLI: {e}]"
-
-    host = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434").rstrip("/")
-    url = host + "/api/generate"
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(
-            {
-                "model": model,
-                "prompt": payload,
-                "stream": False,
-                "options": {"temperature": temperature, "num_predict": max_new_tokens},
-            }
-        ).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
+    messages = [
+        {"role": "system", "content": sys_prompt},
+        {"role": "user", "content": idea},
+    ]
+    text = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    inputs = tok(text, return_tensors="pt").to(model.device)
+    out = model.generate(
+        **inputs,
+        max_new_tokens=max_new_tokens,
+        do_sample=True,
+        temperature=temperature,
+        top_p=0.85,
+        top_k=40,
+        repetition_penalty=1.3,
     )
-    try:
-        with urllib.request.urlopen(req, timeout=180) as resp:
-            js = json.loads(resp.read().decode("utf-8"))
-        return (js.get("response") or "").strip() or "[EMPTY_RESPONSE]"
-    except Exception as e:
-        return f"[ERROR calling ollama HTTP at {url}: {e}]"
+    return tok.decode(out[0], skip_special_tokens=True).strip()
 
 
 # ------------------------- scoring -------------------------
@@ -470,8 +451,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument(
         "--model",
-        default="goonsai/qwen2.5-3B-goonsai-nsfw-100k",
-        help="Ollama model identifier",
+        default="goonsai-com/civitaiprompts/qwen2.5-3B-goonsai-nsfw-100k",
+        help="HuggingFace model repo id",
     )
     ap.add_argument(
         "--prompts_file", type=str, help="Text file with base ideas (one per line)"
@@ -508,6 +489,11 @@ def main():
     ap.add_argument("--max_new_tokens", type=int, default=240)
     ap.add_argument("--temperature", type=float, default=0.4)
     args = ap.parse_args()
+
+    tok = AutoTokenizer.from_pretrained(args.model, use_fast=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model, torch_dtype=torch.bfloat16, device_map="auto"
+    )
 
     random.seed(args.seed)
     outdir = Path(args.outdir)
@@ -567,8 +553,9 @@ def main():
 
     rows: List[Dict[str, Any]] = []
     for i, idea in enumerate(ideas, 1):
-        gen = call_ollama(
-            args.model,
+        gen = expand(
+            tok,
+            model,
             idea,
             max_new_tokens=args.max_new_tokens,
             temperature=args.temperature,
