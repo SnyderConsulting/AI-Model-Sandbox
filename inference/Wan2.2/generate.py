@@ -236,6 +236,12 @@ def _parse_args():
         default=32.0,
         help="LoRA alpha used during training (scales A@B).",
     )
+    parser.add_argument(
+        "--lora_prefix",
+        type=str,
+        default="diffusion_model.",
+        help="Key prefix used when exporting LoRA (must match your training export).",
+    )
 
     # following args only works for s2v
     parser.add_argument(
@@ -294,35 +300,20 @@ def _maybe_load_kv_lora(pipeline, args, logger):
         logger.warning("kv_lora_inject not available; skipping --lora_adapter_path.")
         return
 
-    # 1) Find the WanModel (has .blocks[..].cross_attn.{k,v})
-    target = getattr(pipeline, "dit", None) or getattr(pipeline, "model", None)
-    if target is None:
-        logger.warning("No .dit/.model found on pipeline; cannot apply LoRA.")
-        return
-    # WanModel in training exposed .blocks directly; some builds wrap it in .diffusion_model.
-    base = getattr(target, "diffusion_model", None)
-    if base is None and hasattr(target, "blocks"):
-        base = target
-    if base is None:
-        # Heuristic fallback: walk submodules to find something with .blocks
-        for _, m in target.named_modules():
-            if hasattr(m, "blocks"):
-                base = m
-                break
-    if base is None:
-        logger.warning("Could not locate a transformer with `.blocks`; skipping LoRA.")
-        return
-
-    # 2) Inject LoRA wrappers then load weights
-    loras = inject_lora_kv(base, rank=8, alpha=args.lora_alpha)
-    loaded = load_peft_adapter(
-        base,
+    # Wan TI2V keeps the DiT at .model (TI2V), .dit (T2V), etc.
+    target = (
+        getattr(pipeline, "model", None) or getattr(pipeline, "dit", None) or pipeline
+    )
+    # Inject LoRA stubs into cross-attn K/V and load PEFT-ish weights
+    inject_lora_kv(target, rank=8, alpha=args.lora_alpha)
+    load_peft_adapter(
+        target,
         path=args.lora_adapter_path,
-        prefix="diffusion_model.",
+        prefix=args.lora_prefix,
         alpha=args.lora_alpha,
     )
     logger.info(
-        f"Injected {len(loras)} KV-LoRA modules; loaded {len(loaded)} from {args.lora_adapter_path}"
+        f"Loaded KV-LoRA adapter: {args.lora_adapter_path} (prefix={args.lora_prefix})"
     )
 
 
