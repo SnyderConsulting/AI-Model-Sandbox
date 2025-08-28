@@ -16,6 +16,7 @@ import argparse
 import json
 import os
 import random
+import sys
 from pathlib import Path
 from typing import List, Tuple
 from datetime import datetime, timezone
@@ -43,9 +44,11 @@ try:
 except Exception:
     load_peft_adapter = None
 
-# Wan imports live under the inference package.
-import sys
+# Force the training process to use UMT5 as teacher, regardless of shell env
+os.environ["WAN_USE_BRIDGE"] = "0"
+print(f"[env] WAN_USE_BRIDGE (trainer) = {os.environ.get('WAN_USE_BRIDGE','<unset>')}")
 
+# Wan imports live under the inference package.
 # The Wan2.2 inference package uses a directory name with a dot. To make it
 # importable as a Python package we append it to ``sys.path`` and then import
 # from the ``wan`` submodule.
@@ -272,6 +275,30 @@ def train(args: argparse.Namespace) -> None:
         with open(progress_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(kv) + "\n")
 
+    def _run_sampler_batch(
+        _gen_path, prompts, out_dir, base_cmd_common, adapter_path, env
+    ):
+        import os
+        import shlex
+        import subprocess
+
+        os.makedirs(out_dir, exist_ok=True)
+        # Baseline
+        for i, prompt in enumerate(prompts):
+            cmd = (
+                f'{base_cmd_common} --prompt "{prompt}" '
+                f'--save_file "{os.path.join(out_dir, f"p{i:02d}_baseline.mp4")}"'
+            )
+            subprocess.run(shlex.split(cmd), env=env, check=False)
+        # LoRA
+        for i, prompt in enumerate(prompts):
+            cmd = (
+                f'{base_cmd_common} --prompt "{prompt}" '
+                f'--save_file "{os.path.join(out_dir, f"p{i:02d}_lora.mp4")}" '
+                f'--lora_adapter_path "{adapter_path}" --lora_alpha {args.alpha}'
+            )
+            subprocess.run(shlex.split(cmd), env=env, check=False)
+
     steps_total = 0
 
     with open(args.transformer_config, "r", encoding="utf-8") as f:
@@ -315,6 +342,34 @@ def train(args: argparse.Namespace) -> None:
         print("   ", name)
     if len(loras) > 4:
         print("   ...")
+
+    # ---- Optional: sample once at the very beginning (step 0) ----
+    if args.sample_at_first and args.sample_prompts_file:
+        Path(args.out_dir).mkdir(parents=True, exist_ok=True)
+        ck0 = os.path.join(args.out_dir, "adapter_step_0000000.safetensors")
+        export_peft_adapter(model, ck0, prefix=args.adapter_prefix)
+
+        with open(args.sample_prompts_file, "r", encoding="utf-8") as f:
+            sample_prompts = [ln.strip() for ln in f if ln.strip()][: args.sample_n]
+        samp_dir = os.path.join(args.out_dir, "sample", "step_0000000")
+        env = os.environ.copy()
+        env["WAN_USE_BRIDGE"] = "1"
+        env["WAN_BRIDGE_CKPT"] = args.bridge_ckpt
+        env["WAN_BRIDGE_LLM_DIR"] = args.llm_dir
+        env["WAN_BRIDGE_GLOBAL_SCALE"] = str(args.global_scale)
+        gen = os.path.join(Path(__file__).parent, "inference", "Wan2.2", "generate.py")
+        base = (
+            f'python "{gen}" --task {args.sample_task} '
+            f'--ckpt_dir "{args.transformer_weights_dir or os.path.dirname(args.transformer_weights)}" '
+            f"--size {args.sample_size} --frame_num {args.sample_frame_num} "
+            f"--sample_steps {args.sample_steps} --sample_guide_scale {args.sample_guide_scale} "
+            f"--base_seed {args.sample_seed}"
+        )
+        try:
+            _run_sampler_batch(gen, sample_prompts, samp_dir, base, ck0, env)
+            print(f"[sample] wrote baseline A/B at {samp_dir}")
+        except Exception as e:
+            print(f"[sample] failed at first: {e}")
 
     # --- encoders ---------------------------------------------------------
     # robust text length getter
@@ -466,9 +521,6 @@ def train(args: argparse.Namespace) -> None:
                     and (steps_total % args.sample_every_steps == 0)
                 ):
                     try:
-                        import subprocess
-                        import shlex
-
                         with open(args.sample_prompts_file, "r", encoding="utf-8") as f:
                             prompts = [ln.strip() for ln in f if ln.strip()][
                                 : args.sample_n
@@ -476,7 +528,6 @@ def train(args: argparse.Namespace) -> None:
                         samp_dir = os.path.join(
                             args.out_dir, "sample", f"step_{steps_total:07d}"
                         )
-                        os.makedirs(samp_dir, exist_ok=True)
                         env = os.environ.copy()
                         env["WAN_USE_BRIDGE"] = "1"
                         env["WAN_BRIDGE_CKPT"] = args.bridge_ckpt
@@ -488,20 +539,14 @@ def train(args: argparse.Namespace) -> None:
                             "Wan2.2",
                             "generate.py",
                         )
-                        for i, prompt in enumerate(prompts):
-                            cmd_base = (
-                                f'python "{gen}" --task {args.sample_task} --ckpt_dir "{args.transformer_weights_dir or os.path.dirname(args.transformer_weights)}" '
-                                f"--size {args.sample_size} --frame_num {args.sample_frame_num} --sample_steps {args.sample_steps} "
-                                f'--sample_guide_scale {args.sample_guide_scale} --base_seed {args.sample_seed} --prompt "{prompt}" '
-                                f'--save_file "{os.path.join(samp_dir, f"p{i:02d}_baseline.mp4")}"'
-                            )
-                            subprocess.run(shlex.split(cmd_base), env=env, check=False)
-                            cmd_lora = (
-                                cmd_base
-                                + f' --lora_adapter_path "{ck_step}" --lora_alpha {args.alpha}'
-                            )
-                            cmd_lora = cmd_lora.replace("baseline.mp4", "lora.mp4")
-                            subprocess.run(shlex.split(cmd_lora), env=env, check=False)
+                        base = (
+                            f'python "{gen}" --task {args.sample_task} '
+                            f'--ckpt_dir "{args.transformer_weights_dir or os.path.dirname(args.transformer_weights)}" '
+                            f"--size {args.sample_size} --frame_num {args.sample_frame_num} "
+                            f"--sample_steps {args.sample_steps} --sample_guide_scale {args.sample_guide_scale} "
+                            f"--base_seed {args.sample_seed}"
+                        )
+                        _run_sampler_batch(gen, prompts, samp_dir, base, ck_step, env)
                     except Exception as e:
                         print(f"[sample] failed to auto-sample: {e}")
 
@@ -651,6 +696,12 @@ def build_argparser() -> argparse.ArgumentParser:
         type=int,
         default=0,
         help="0=off; sample every N steps when a checkpoint is saved",
+    )
+    # Run one sampling pass before training starts (baseline at step 0)
+    p.add_argument(
+        "--sample_at_first",
+        action="store_true",
+        help="Run A/B sampling once before the first step (baseline vs empty LoRA).",
     )
     p.add_argument(
         "--sample_prompts_file",
