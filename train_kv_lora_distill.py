@@ -324,7 +324,13 @@ def _rebuild_training(cfg, args):
 
 
 def _run_sampler_batch(
-    gen_script, prompts, ckpt_dir, save_dir, args, adapter_path=None
+    gen_script,
+    prompts,
+    ckpt_dir,
+    save_dir,
+    args,
+    adapter_path=None,
+    mode="lora_only",
 ):
     os.makedirs(save_dir, exist_ok=True)
     env = os.environ.copy()
@@ -345,16 +351,20 @@ def _run_sampler_batch(
             f"--base_seed {args.sample_seed} --prompt {shlex.quote(prompt)} "
             f'--save_file "{base_out}" --offload_model True {t5flag}'
         )
-        subprocess.run(shlex.split(cmd_base), env=env, check=False)
+        if mode in ("both", "baseline_only"):
+            print(f"[sample] baseline -> {base_out}")
+            subprocess.run(shlex.split(cmd_base), env=env, check=True)
 
-        if adapter_path:
+        if adapter_path and mode in ("both", "lora_only"):
             lora_out = base_out.replace("baseline.mp4", "lora.mp4")
             cmd_lora = (
                 cmd_base
-                + f' --lora_adapter_path "{adapter_path}" --lora_prefix {args.adapter_prefix} --lora_alpha {args.alpha} '
+                + f' --lora_adapter_path "{adapter_path}"'
+                + f" --lora_prefix {args.adapter_prefix} --lora_alpha {args.alpha} "
                 + f' --save_file "{lora_out}"'
             )
-            subprocess.run(shlex.split(cmd_lora), env=env, check=False)
+            print(f"[sample] lora     -> {lora_out} (adapter={adapter_path})")
+            subprocess.run(shlex.split(cmd_lora), env=env, check=True)
 
 
 # -----------------------------------------------------------------------------
@@ -513,7 +523,8 @@ def train(args: argparse.Namespace) -> None:
             ),
             save_dir=samp_dir,
             args=args,
-            adapter_path=zero_path,
+            adapter_path=(zero_path if args.sample_lora_at_first else None),
+            mode=("both" if args.sample_lora_at_first else "baseline_only"),
         )
         if args.sample_pause_training:
             model, teacher_enc, bridge_enc, optim = _rebuild_training(cfg, args)
@@ -638,6 +649,7 @@ def train(args: argparse.Namespace) -> None:
                             save_dir=samp_dir,
                             args=args,
                             adapter_path=ck_step,
+                            mode=args.sample_mode,
                         )
                     except Exception as e:
                         print(f"[sample] failed to auto-sample: {e}")
@@ -819,6 +831,13 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--sample_guide_scale", type=float, default=5.5)
     p.add_argument("--sample_frame_num", type=int, default=17)
     p.add_argument("--sample_seed", type=int, default=12345)
+    p.add_argument(
+        "--sample_mode",
+        type=str,
+        default="lora_only",
+        choices=["both", "lora_only", "baseline_only"],
+        help="What to render at sampling points. Default lora_only (after the first baseline).",
+    )
     p.add_argument(
         "--sample_at_first",
         action="store_true",
