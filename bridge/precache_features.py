@@ -4,7 +4,13 @@ import gc
 from pathlib import Path
 
 import torch
-from transformers import AutoTokenizer, AutoModel
+from transformers import AutoConfig, AutoTokenizer, AutoModel
+
+try:  # optional VL support
+    from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
+except Exception:  # pragma: no cover - optional
+    AutoProcessor = None
+    Qwen2_5_VLForConditionalGeneration = None
 
 # Throughput knobs on A100
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -58,13 +64,68 @@ def main():
     out_dir_path = Path(args.out_dir)
     out_dir_path.mkdir(parents=True, exist_ok=True)
 
-    print("[precache] loading LLM (base decoder)…")
-    tok = AutoTokenizer.from_pretrained(args.llm_dir, use_fast=True)
-    # Use AutoModel (decoder base) so we can read last_hidden_state directly
-    llm_model = AutoModel.from_pretrained(
-        args.llm_dir, torch_dtype=torch.bfloat16, device_map="auto"
+    cfg = AutoConfig.from_pretrained(args.llm_dir)
+    is_vl = "qwen2_vl" in getattr(cfg, "model_type", "") or "qwen2_5_vl" in getattr(
+        cfg, "model_type", ""
     )
-    llm_model.eval().requires_grad_(False)
+    if is_vl and AutoProcessor and Qwen2_5_VLForConditionalGeneration:
+        print("[precache] loading LLM (Qwen-VL)…")
+        proc = AutoProcessor.from_pretrained(args.llm_dir)
+        vl = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+            args.llm_dir, torch_dtype=torch.bfloat16, device_map="auto"
+        )
+        vl.eval().requires_grad_(False)
+
+        @torch.inference_mode()
+        def encode_llm(batch_caps):
+            inputs = proc(
+                text=batch_caps,
+                images=None,
+                videos=None,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=args.llm_max_length,
+            )
+            inputs = {
+                k: (v.to(next(vl.parameters()).device) if hasattr(v, "to") else v)
+                for k, v in inputs.items()
+            }
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                out = vl(
+                    **inputs,
+                    output_hidden_states=False,
+                    use_cache=False,
+                    return_dict=True,
+                )
+            h = out.last_hidden_state.to(torch.bfloat16)
+            m = inputs["attention_mask"].bool()
+            return h, m
+
+    else:
+        print("[precache] loading LLM (base decoder)…")
+        tok = AutoTokenizer.from_pretrained(args.llm_dir, use_fast=True)
+        llm_model = AutoModel.from_pretrained(
+            args.llm_dir, torch_dtype=torch.bfloat16, device_map="auto"
+        )
+        llm_model.eval().requires_grad_(False)
+
+        @torch.inference_mode()
+        def encode_llm(batch_caps):
+            enc = tok(
+                batch_caps,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=args.llm_max_length,
+            ).to(llm_model.device)
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                llm_out = llm_model(
+                    **enc, output_hidden_states=False, use_cache=False, return_dict=True
+                )
+            h = llm_out.last_hidden_state.to(torch.bfloat16)
+            m = enc["attention_mask"].bool()
+            return h, m
 
     print("[precache] loading Wan teacher…")
     from teachers.wan_text_teacher_from_wan import WanTextTeacher
@@ -73,23 +134,6 @@ def main():
 
     buf_idx, buf_caps = [], []
     shard_id, total = 0, 0
-
-    @torch.inference_mode()
-    def encode_llm(batch_caps):
-        enc = tok(
-            batch_caps,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=args.llm_max_length,
-        ).to(llm_model.device)
-        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            llm_out = llm_model(
-                **enc, output_hidden_states=False, use_cache=False, return_dict=True
-            )
-        h = llm_out.last_hidden_state.to(torch.bfloat16)  # [b, Lt, d_llm]
-        m = enc["attention_mask"].bool()
-        return h, m
 
     @torch.inference_mode()
     def encode_teacher(batch_caps):

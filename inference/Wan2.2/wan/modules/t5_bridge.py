@@ -7,12 +7,21 @@ from typing import List, Optional, Union
 
 import torch
 import torch.nn as nn
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
+
+try:  # optional VL support
+    from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
+except Exception:  # pragma: no cover - missing optional deps
+    AutoProcessor = None
+    Qwen2_5_VLForConditionalGeneration = None
 
 
 # ------------------------ utils ------------------------
 
-def _resolve_device(device_id: Union[int, str, torch.device, None], t5_cpu: bool) -> torch.device:
+
+def _resolve_device(
+    device_id: Union[int, str, torch.device, None], t5_cpu: bool
+) -> torch.device:
     """
     device_id can be int (local rank), str ('cuda', 'cuda:0', 'cpu'), torch.device, or None.
     t5_cpu forces CPU regardless of device_id.
@@ -42,6 +51,7 @@ def _resolve_device(device_id: Union[int, str, torch.device, None], t5_cpu: bool
 
 # ------------------------ bridge (Perceiver-style) ------------------------
 
+
 class _MLP(nn.Module):
     def __init__(self, d: int, mult: int = 4):
         super().__init__()
@@ -58,16 +68,25 @@ class _CrossBlock(nn.Module):
         super().__init__()
         self.q_ln = nn.LayerNorm(d, eps=1e-5)
         self.kv_ln = nn.LayerNorm(d, eps=1e-5)
-        self.mha = nn.MultiheadAttention(embed_dim=d, num_heads=n_heads, dropout=dropout, batch_first=True)
+        self.mha = nn.MultiheadAttention(
+            embed_dim=d, num_heads=n_heads, dropout=dropout, batch_first=True
+        )
         self.mlp_ln = nn.LayerNorm(d, eps=1e-5)
         self.mlp = _MLP(d, mult=4)
 
-    def forward(self, q: torch.Tensor, kv: torch.Tensor, kv_mask: Optional[torch.BoolTensor] = None) -> torch.Tensor:
+    def forward(
+        self,
+        q: torch.Tensor,
+        kv: torch.Tensor,
+        kv_mask: Optional[torch.BoolTensor] = None,
+    ) -> torch.Tensor:
         qn, kvn = self.q_ln(q), self.kv_ln(kv)
         attn_out, _ = self.mha(
-            qn, kvn, kvn,
+            qn,
+            kvn,
+            kvn,
             key_padding_mask=(~kv_mask) if kv_mask is not None else None,
-            need_weights=False
+            need_weights=False,
         )
         x = q + attn_out
         x = x + self.mlp(self.mlp_ln(x))
@@ -78,6 +97,7 @@ class PerceiverBridge(nn.Module):
     """
     Map LLM token states [B, Lt, d_llm] → Wan-style tokens [B, L_wan, d_wan].
     """
+
     def __init__(
         self,
         d_llm: int = 5120,
@@ -91,24 +111,29 @@ class PerceiverBridge(nn.Module):
         self.L_wan = L_wan
         self.query = nn.Parameter(torch.randn(L_wan, d_mid) / math.sqrt(d_mid))
         self.in_proj = nn.Linear(d_llm, d_mid)
-        self.blocks = nn.ModuleList([_CrossBlock(d_mid, n_heads) for _ in range(n_blocks)])
+        self.blocks = nn.ModuleList(
+            [_CrossBlock(d_mid, n_heads) for _ in range(n_blocks)]
+        )
         self.out_ln = nn.LayerNorm(d_mid, eps=1e-5)
         self.out_proj = nn.Linear(d_mid, d_wan)
         # learned affine to match Wan feature stats
         self.out_scale = nn.Parameter(torch.ones(1, 1, d_wan))
         self.out_shift = nn.Parameter(torch.zeros(1, 1, d_wan))
 
-    def forward(self, llm_tokens: torch.Tensor, llm_mask: Optional[torch.BoolTensor] = None) -> torch.Tensor:
+    def forward(
+        self, llm_tokens: torch.Tensor, llm_mask: Optional[torch.BoolTensor] = None
+    ) -> torch.Tensor:
         B, Lt, _ = llm_tokens.shape
         x_tokens = self.in_proj(llm_tokens)
         q = self.query.unsqueeze(0).expand(B, -1, -1).contiguous()
         for blk in self.blocks:
             q = blk(q, x_tokens, kv_mask=llm_mask)
         h = self.out_proj(self.out_ln(q))
-        return h * self.out_scale + self.out_shift   # [B, L_wan, d_wan]
+        return h * self.out_scale + self.out_shift  # [B, L_wan, d_wan]
 
 
 # ------------------------ drop-in encoder ------------------------
+
 
 class BridgeEncoderModel:
     """
@@ -132,15 +157,17 @@ class BridgeEncoderModel:
         text_len: int,
         dtype: torch.dtype = torch.bfloat16,
         device: Union[int, str, torch.device] = "cuda",
-        checkpoint_path: Optional[str] = None,     # ignored (we use env)
-        tokenizer_path: Optional[str] = None,      # ignored
-        shard_fn=None,                             # ignored (Accelerate handles sharding)
-        **kwargs,                                  # absorb unknown args to stay API-compatible
+        checkpoint_path: Optional[str] = None,  # ignored (we use env)
+        tokenizer_path: Optional[str] = None,  # ignored
+        shard_fn=None,  # ignored (Accelerate handles sharding)
+        **kwargs,  # absorb unknown args to stay API-compatible
     ):
         # --- config / env ---
         self.L_wan = int(os.environ.get("WAN_TEXT_LEN", text_len or 512))
         self.d_wan = int(os.environ.get("WAN_TEXT_DIM", 4096))
-        self.llm_dir = os.environ.get("WAN_BRIDGE_LLM_DIR", "/workspace/models/MythoMax-L2-13B")
+        self.llm_dir = os.environ.get(
+            "WAN_BRIDGE_LLM_DIR", "/workspace/models/MythoMax-L2-13B"
+        )
         self.ckpt_path = os.environ.get("WAN_BRIDGE_CKPT", "")
         self.llm_max = int(os.environ.get("WAN_LLM_MAXLEN", 512))
         dt_str = os.environ.get("WAN_BRIDGE_DTYPE", "bf16").lower()
@@ -150,38 +177,60 @@ class BridgeEncoderModel:
 
         # NEW: global affine knobs for crude calibration (env-driven)
         self.global_scale = float(os.environ.get("WAN_BRIDGE_GLOBAL_SCALE", "1.0"))
-        self.global_bias  = float(os.environ.get("WAN_BRIDGE_GLOBAL_BIAS", "0.0"))
+        self.global_bias = float(os.environ.get("WAN_BRIDGE_GLOBAL_BIAS", "0.0"))
 
         if not self.ckpt_path or not os.path.exists(self.ckpt_path):
-            raise FileNotFoundError("WAN_BRIDGE_CKPT must point to a valid bridge checkpoint (*.pth).")
+            raise FileNotFoundError(
+                "WAN_BRIDGE_CKPT must point to a valid bridge checkpoint (*.pth)."
+            )
 
         # --- load LLM (tokenizer + model) ---
-        self.tok = AutoTokenizer.from_pretrained(self.llm_dir, use_fast=True)
+        cfg = AutoConfig.from_pretrained(self.llm_dir)
+        mt = getattr(cfg, "model_type", "")
+        is_vl = "qwen2_vl" in mt or "qwen2_5_vl" in mt
+
         device_map = "auto" if self.device.type == "cuda" else None
-        self.llm = AutoModelForCausalLM.from_pretrained(
-            self.llm_dir, torch_dtype=self.dtype, device_map=device_map
-        )
+        if is_vl and AutoProcessor and Qwen2_5_VLForConditionalGeneration:
+            self.tok = AutoProcessor.from_pretrained(self.llm_dir)
+            self.llm = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                self.llm_dir, torch_dtype=self.dtype, device_map=device_map
+            )
+            self._encode = "vl"
+        else:
+            self.tok = AutoTokenizer.from_pretrained(self.llm_dir, use_fast=True)
+            self.llm = AutoModelForCausalLM.from_pretrained(
+                self.llm_dir, torch_dtype=self.dtype, device_map=device_map
+            )
+            self._encode = "causal"
         self.llm.eval().requires_grad_(False)
 
         d_llm = getattr(self.llm.config, "hidden_size", None)
         if d_llm is None:
-            raise RuntimeError("Loaded LLM has no config.hidden_size; cannot build bridge.")
+            raise RuntimeError(
+                "Loaded LLM has no config.hidden_size; cannot build bridge."
+            )
 
         # --- build + load bridge ---
-        self.bridge = PerceiverBridge(
-            d_llm=d_llm,
-            d_wan=self.d_wan,
-            L_wan=self.L_wan,
-            d_mid=1024,
-            n_heads=16,
-            n_blocks=3,
-        ).to(self.device, dtype=self.dtype).eval()
+        self.bridge = (
+            PerceiverBridge(
+                d_llm=d_llm,
+                d_wan=self.d_wan,
+                L_wan=self.L_wan,
+                d_mid=1024,
+                n_heads=16,
+                n_blocks=3,
+            )
+            .to(self.device, dtype=self.dtype)
+            .eval()
+        )
 
         ckpt = torch.load(self.ckpt_path, map_location="cpu")
         sd = ckpt.get("bridge", ckpt)
         missing, unexpected = self.bridge.load_state_dict(sd, strict=False)
         if missing or unexpected:
-            print(f"[BridgeEncoderModel] Warning while loading state_dict: missing={missing}, unexpected={unexpected}")
+            print(
+                f"[BridgeEncoderModel] Warning while loading state_dict: missing={missing}, unexpected={unexpected}"
+            )
 
         # --- perf knobs ---
         torch.backends.cuda.matmul.allow_tf32 = True
@@ -219,8 +268,14 @@ class BridgeEncoderModel:
                     try:
                         outer_llm_dev = next(self.llm.parameters()).device
                     except StopIteration:
-                        outer_llm_dev = torch.device(device) if not isinstance(device, torch.device) else device
-                    outer._llm_in_device = outer_llm_dev  # used for token tensor placement
+                        outer_llm_dev = (
+                            torch.device(device)
+                            if not isinstance(device, torch.device)
+                            else device
+                        )
+                    outer._llm_in_device = (
+                        outer_llm_dev  # used for token tensor placement
+                    )
                 if dtype is not None:
                     if not hasattr(self.llm, "hf_device_map"):
                         self.llm.to(dtype=dtype)
@@ -242,27 +297,58 @@ class BridgeEncoderModel:
         )
 
     @torch.no_grad()
-    def __call__(self, texts: List[str], device: Optional[Union[int, str, torch.device]] = None):
+    def __call__(
+        self, texts: List[str], device: Optional[Union[int, str, torch.device]] = None
+    ):
         """
         Returns a list of [L_i, d_wan] tensors (trimmed per-sample lengths),
         mirroring Wan's stock T5EncoderModel API.
         """
-        out_device = _resolve_device(device, False) if device is not None else self.device
+        out_device = (
+            _resolve_device(device, False) if device is not None else self.device
+        )
 
-        # Always query the *current* LLM device (Wan may have moved us via .model.to(...))
-        try:
-            llm_in_device = next(self.llm.parameters()).device
-        except StopIteration:
-            llm_in_device = self._llm_in_device
-
-        # Tokenize on the LLM's input device (works with device_map="auto" or moved single-device models)
-        enc = self.tok(
-            texts, return_tensors="pt", padding=True, truncation=True, max_length=self.llm_max
-        ).to(llm_in_device)
-
-        out = self.llm(**enc, output_hidden_states=True, use_cache=False)
-        h_llm = out.hidden_states[-1]             # [B, Lt, d_llm]
-        m_llm = enc["attention_mask"].bool()      # [B, Lt]
+        if self._encode == "vl":
+            inputs = self.tok(
+                text=texts,
+                images=None,
+                videos=None,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=self.llm_max,
+            )
+            try:
+                llm_in_device = next(self.llm.parameters()).device
+            except StopIteration:
+                llm_in_device = self._llm_in_device
+            inputs = {
+                k: (v.to(llm_in_device) if hasattr(v, "to") else v)
+                for k, v in inputs.items()
+            }
+            out = self.llm(
+                **inputs, output_hidden_states=True, use_cache=False, return_dict=True
+            )
+            h_llm = out.hidden_states[-1]
+            m_llm = inputs["attention_mask"].bool()
+        else:
+            enc = self.tok(
+                texts,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=self.llm_max,
+            )
+            try:
+                llm_in_device = next(self.llm.parameters()).device
+            except StopIteration:
+                llm_in_device = self._llm_in_device
+            enc = enc.to(llm_in_device)
+            out = self.llm(
+                **enc, output_hidden_states=True, use_cache=False, return_dict=True
+            )
+            h_llm = out.hidden_states[-1]
+            m_llm = enc["attention_mask"].bool()
 
         # Run the bridge on *its current* device
         try:
@@ -270,7 +356,9 @@ class BridgeEncoderModel:
         except StopIteration:
             bridge_device = out_device
 
-        H_wan = self.bridge(h_llm.to(bridge_device), m_llm.to(bridge_device))  # [B, L_wan, d_wan]
+        H_wan = self.bridge(
+            h_llm.to(bridge_device), m_llm.to(bridge_device)
+        )  # [B, L_wan, d_wan]
 
         # --- crude global affine for sanity test ---
         if self.global_scale != 1.0 or self.global_bias != 0.0:
