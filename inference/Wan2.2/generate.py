@@ -10,8 +10,9 @@ import random
 # Allow running without PYTHONPATH set to repo root
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 try:
-    from kv_lora_inject import load_peft_adapter
+    from kv_lora_inject import inject_lora_kv, load_peft_adapter
 except Exception:
+    inject_lora_kv = None
     load_peft_adapter = None
 
 import torch
@@ -286,10 +287,8 @@ def _init_logging(rank):
 def _maybe_load_kv_lora(pipeline, args, logger):
     if not args.lora_adapter_path:
         return
-    if load_peft_adapter is None:
-        logger.warning(
-            "kv_lora_inject.load_peft_adapter not available; skipping --lora_adapter_path."
-        )
+    if load_peft_adapter is None or inject_lora_kv is None:
+        logger.warning("kv_lora_inject not available; skipping --lora_adapter_path.")
         return
     target = getattr(pipeline, "dit", None) or getattr(pipeline, "model", None)
     if target is None:
@@ -297,6 +296,11 @@ def _maybe_load_kv_lora(pipeline, args, logger):
             "Could not locate underlying DiT (no .dit or .model); skipping --lora_adapter_path."
         )
         return
+    base = getattr(target, "diffusion_model", None)
+    if base is None:
+        logger.warning("Target has no diffusion_model; skipping --lora_adapter_path.")
+        return
+    inject_lora_kv(base, rank=8, alpha=args.lora_alpha)
     load_peft_adapter(
         target,
         path=args.lora_adapter_path,
