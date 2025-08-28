@@ -3,7 +3,7 @@
 # Works without PEFT; produces a PEFT-compatible state dict for adapter_model.safetensors.
 
 from __future__ import annotations
-from typing import Dict, Iterable, List, Tuple, Optional
+from typing import Dict, Iterable, List, Tuple
 
 import torch
 import torch.nn as nn
@@ -155,17 +155,26 @@ def export_peft_adapter(
     safetensors_save(state, save_path, metadata={"format": "pt"})
 
 
-# ---------- RUNTIME LOADER ----------
+# ---- Runtime loader (PEFT-ish) ----
 
 
-def _infer_rank_from_adapter(path: str, prefix: str = "diffusion_model.") -> int:
-    """Read one lora_A tensor to infer the LoRA rank."""
-    with safe_open(path, framework="pt", device="cpu") as f:
-        for k in f.keys():
-            if k.endswith(".lora_A.weight") and k.startswith(prefix):
-                # lora_A has shape [rank, in_features]
-                return int(f.get_tensor(k).shape[0])
-    raise RuntimeError("Could not infer LoRA rank from adapter file.")
+def _get_submodule(root: nn.Module, path: str) -> nn.Module:
+    """Traverse a dotted path like 'blocks.0.cross_attn.k'."""
+    mod = root
+    for part in path.split("."):
+        if part.isdigit():
+            mod = mod[int(part)]  # ModuleList / list
+        else:
+            mod = getattr(mod, part)
+    return mod
+
+
+def _set_submodule(root: nn.Module, path: str, new: nn.Module) -> None:
+    parts = path.split(".")
+    parent = root
+    for part in parts[:-1]:
+        parent = parent[int(part)] if part.isdigit() else getattr(parent, part)
+    setattr(parent, parts[-1], new)
 
 
 def load_peft_adapter(
@@ -174,24 +183,51 @@ def load_peft_adapter(
     prefix: str = "diffusion_model.",
     alpha: float = 32.0,
     dropout: float = 0.0,
-    blocks_range: Optional[Tuple[int, int]] = None,
 ) -> Dict[str, LoRALinear]:
     """
-    Inject KV LoRA into the model with the correct rank and load weights from `path`.
-    Returns: dict of injected modules, same keys as inject_lora_kv.
+    Load a KV-only LoRA adapter saved by export_peft_adapter(...).
+    Returns: dict mapping 'blocks.{i}.cross_attn.{k|v}' -> LoRALinear
     """
-
-    rank = _infer_rank_from_adapter(path, prefix=prefix)
-    loras = inject_lora_kv(
-        model, rank=rank, alpha=alpha, dropout=dropout, blocks_range=blocks_range
-    )
-    # load weights
+    # Read tensors
+    tensors: Dict[str, torch.Tensor] = {}
     with safe_open(path, framework="pt", device="cpu") as f:
-        for name, module in model.named_modules():
-            if isinstance(module, LoRALinear):
-                key_A = f"{prefix}{name}.lora_A.weight"
-                key_B = f"{prefix}{name}.lora_B.weight"
-                module.lora_A.weight.copy_(f.get_tensor(key_A))
-                module.lora_B.weight.copy_(f.get_tensor(key_B))
-                module.enabled = True
-    return loras
+        for k in f.keys():
+            tensors[k] = f.get_tensor(k)
+
+    # Group by module path
+    groups: Dict[str, Dict[str, torch.Tensor]] = {}
+    for k, t in tensors.items():
+        if not k.startswith(prefix):
+            continue
+        tail = k[len(prefix) :]
+        if tail.endswith(".lora_A.weight"):
+            mpath = tail[: -len(".lora_A.weight")]
+            groups.setdefault(mpath, {})["A"] = t
+        elif tail.endswith(".lora_B.weight"):
+            mpath = tail[: -len(".lora_B.weight")]
+            groups.setdefault(mpath, {})["B"] = t
+
+    # Inject wrappers and load weights
+    loaded: Dict[str, LoRALinear] = {}
+    for mpath, parts in groups.items():
+        A = parts.get("A")
+        B = parts.get("B")
+        if A is None or B is None:
+            continue
+        rank = A.shape[1]
+        base = _get_submodule(model, mpath)
+        if isinstance(base, LoRALinear):
+            lora = base
+        else:
+            assert isinstance(
+                base, nn.Linear
+            ), f"Expected nn.Linear at {mpath}, got {type(base)}"
+            lora = LoRALinear(base, rank=rank, alpha=alpha, dropout=dropout)
+            _set_submodule(model, mpath, lora)
+        with torch.no_grad():
+            lora.lora_A.weight.copy_(A)
+            lora.lora_B.weight.copy_(B)
+            lora.enabled = True
+        loaded[mpath] = lora
+
+    return loaded

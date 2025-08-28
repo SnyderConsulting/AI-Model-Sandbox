@@ -7,17 +7,22 @@ import warnings
 from datetime import datetime
 import random
 
+# Allow running without PYTHONPATH set to repo root
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
+try:
+    from kv_lora_inject import load_peft_adapter
+except Exception:
+    load_peft_adapter = None
+
 import torch
 import torch.distributed as dist
 from PIL import Image
 
 import wan
-from wan.modules.model import WanModel
 from wan.configs import MAX_AREA_CONFIGS, SIZE_CONFIGS, SUPPORTED_SIZES, WAN_CONFIGS
 from wan.distributed.util import init_distributed_group
 from wan.utils.prompt_extend import DashScopePromptExpander, QwenPromptExpander
 from wan.utils.utils import merge_video_audio, save_video, str2bool
-from kv_lora_inject import load_peft_adapter
 
 warnings.filterwarnings("ignore")
 
@@ -215,24 +220,18 @@ def _parse_args():
         default=False,
         help="Whether to convert model paramerters dtype.",
     )
-    # KV-LoRA (KV-only cross-attn) adapter support
+    # KV-LoRA adapter support
     parser.add_argument(
-        "--kv_lora_adapter",
+        "--lora_adapter_path",
         type=str,
         default=None,
-        help="Path to a KV-LoRA adapter .safetensors (KV-only cross-attn).",
+        help="Path to KV-LoRA adapter .safetensors (cross_attn K/V).",
     )
     parser.add_argument(
-        "--kv_lora_prefix",
-        type=str,
-        default="diffusion_model.",
-        help="Key prefix inside the adapter file (e.g., diffusion_model. or transformer.).",
-    )
-    parser.add_argument(
-        "--kv_lora_alpha",
+        "--lora_alpha",
         type=float,
         default=32.0,
-        help="LoRA alpha used during training; controls scaling at runtime.",
+        help="LoRA alpha used during training (scales A@B).",
     )
 
     # following args only works for s2v
@@ -284,41 +283,27 @@ def _init_logging(rank):
         logging.basicConfig(level=logging.ERROR)
 
 
-def _find_wan_model(obj, depth=0, max_depth=4):
-    if isinstance(obj, WanModel):
-        return obj
-    if depth >= max_depth or not hasattr(obj, "__dict__"):
-        return None
-    # Try common attribute names first
-    for name in ("dit", "model", "transformer", "backbone", "wan_model"):
-        if hasattr(obj, name):
-            m = _find_wan_model(getattr(obj, name), depth + 1, max_depth)
-            if m is not None:
-                return m
-    # Fallback: scan attributes
-    for v in obj.__dict__.values():
-        m = _find_wan_model(v, depth + 1, max_depth)
-        if m is not None:
-            return m
-    return None
-
-
-def _maybe_apply_kv_lora(pipeline, args, logger):
-    if not args.kv_lora_adapter:
+def _maybe_load_kv_lora(pipeline, args, logger):
+    if not args.lora_adapter_path:
         return
-    target = _find_wan_model(pipeline)
-    if target is None:
+    if load_peft_adapter is None:
         logger.warning(
-            "KV-LoRA: Could not locate WanModel inside pipeline; adapter NOT applied."
+            "kv_lora_inject.load_peft_adapter not available; skipping --lora_adapter_path."
         )
         return
-    loras = load_peft_adapter(
+    target = getattr(pipeline, "dit", None) or getattr(pipeline, "model", None)
+    if target is None:
+        logger.warning(
+            "Could not locate underlying DiT (no .dit or .model); skipping --lora_adapter_path."
+        )
+        return
+    load_peft_adapter(
         target,
-        path=args.kv_lora_adapter,
-        prefix=args.kv_lora_prefix,
-        alpha=float(args.kv_lora_alpha),
+        path=args.lora_adapter_path,
+        prefix="diffusion_model.",
+        alpha=args.lora_alpha,
     )
-    logger.info(f"KV-LoRA: applied {len(loras)} modules from {args.kv_lora_adapter}")
+    logger.info(f"Loaded KV-LoRA adapter: {args.lora_adapter_path}")
 
 
 def generate(args):
@@ -426,7 +411,7 @@ def generate(args):
             t5_cpu=args.t5_cpu,
             convert_model_dtype=args.convert_model_dtype,
         )
-        _maybe_apply_kv_lora(wan_t2v, args, logging)
+        _maybe_load_kv_lora(wan_t2v, args, logging)
 
         logging.info("Generating video ...")
         video = wan_t2v.generate(
@@ -453,7 +438,7 @@ def generate(args):
             t5_cpu=args.t5_cpu,
             convert_model_dtype=args.convert_model_dtype,
         )
-        _maybe_apply_kv_lora(wan_ti2v, args, logging)
+        _maybe_load_kv_lora(wan_ti2v, args, logging)
 
         logging.info("Generating video ...")
         video = wan_ti2v.generate(
@@ -482,7 +467,7 @@ def generate(args):
             t5_cpu=args.t5_cpu,
             convert_model_dtype=args.convert_model_dtype,
         )
-        _maybe_apply_kv_lora(wan_s2v, args, logging)
+        _maybe_load_kv_lora(wan_s2v, args, logging)
         logging.info("Generating video ...")
         video = wan_s2v.generate(
             input_prompt=args.prompt,
@@ -514,7 +499,7 @@ def generate(args):
             t5_cpu=args.t5_cpu,
             convert_model_dtype=args.convert_model_dtype,
         )
-        _maybe_apply_kv_lora(wan_i2v, args, logging)
+        _maybe_load_kv_lora(wan_i2v, args, logging)
 
         logging.info("Generating video ...")
         video = wan_i2v.generate(
