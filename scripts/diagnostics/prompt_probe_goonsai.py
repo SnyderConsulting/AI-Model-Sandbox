@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-prompt_probe_goonsai.py — quick A/B *within* the Goonsai Qwen2.5 NSFW prompt writer
+prompt_probe_goonsai.py — quick probe for Goonsai Qwen2.5 NSFW prompt writer
 
 What it does
 ------------
-- Expands base "ideas" into CivitAI/Stable‑Diffusion style prompts using:
-    • goonsai/qwen2.5-3B-goonsai-nsfw-100k  (default; via `ollama run`)
+- Expands short "ideas" into CivitAI/Stable‑Diffusion style prompts via Ollama:
+    goonsai/qwen2.5-3B-goonsai-nsfw-100k
 - Scores generations with simple, diffusion-relevant text features:
     • token count
     • photography/camera/lighting lexicon hits
@@ -15,12 +15,14 @@ What it does
 - Saves CSV/JSON results and a small aggregate table (means per run).
 - Can sample your JSONL dataset (key='caption') to use *your* domain text as seeds.
 - Can auto-build a domain NSFW lexicon from your JSONL sample for better scoring.
+- Works with `ollama run` if the CLI is present, or falls back to HTTP POST
+  to `OLLAMA_HOST:/api/generate` if not.
 
 Prereqs
 -------
 - Install and run Ollama with the Goonsai model pulled locally:
     ollama pull goonsai/qwen2.5-3B-goonsai-nsfw-100k
-  (If using a remote Ollama server, set OLLAMA_HOST as usual.)
+  (If using a remote Ollama server, set OLLAMA_HOST accordingly.)
 
 Examples
 --------
@@ -48,17 +50,21 @@ Outputs (default /tmp/prompt_probe_goonsai):
 Notes
 -----
 - This script is content-agnostic but assumes *adult* NSFW data. Ensure your data is 18+.
-- If `ollama run` fails, the script records an [ERROR ...] string in the generation field.
+- If both CLI and HTTP calls fail, the script records an [ERROR ...] string in
+  the generation field.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 import re
+import shutil
 import subprocess
 import time
+import urllib.request
 from collections import Counter
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -373,27 +379,50 @@ def build_lexicon_from_jsonl(
 
 
 def call_ollama(
-    model: str, prompt: str, max_new_tokens: int = 240, temperature: float = 0.4
+    model: str, idea: str, max_new_tokens: int = 240, temperature: float = 0.4
 ) -> str:
-    """Calls `ollama run <model>` and returns the text completion (stdout)."""
     sys_prompt = (
         "You are a prompt engineer for diffusion/video models. "
         "Given a short idea, expand it into a CivitAI/Stable‑Diffusion style prompt: "
         "quality tags, subject, anatomy (if relevant), pose/action, setting, lighting, camera/lens, "
         "technical specs. End with an optional 'Negative prompt:' line. Use comma‑separated phrases."
     )
-    payload = f"{sys_prompt}\n\nIdea: {prompt}\nPrompt:"
+    payload = f"{sys_prompt}\n\nIdea: {idea}\nPrompt:"
+
+    if shutil.which("ollama"):
+        try:
+            proc = subprocess.run(
+                ["ollama", "run", model],
+                input=payload,
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+            return proc.stdout.strip()
+        except Exception as e:
+            return f"[ERROR calling ollama CLI: {e}]"
+
+    host = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434").rstrip("/")
+    url = host + "/api/generate"
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(
+            {
+                "model": model,
+                "prompt": payload,
+                "stream": False,
+                "options": {"temperature": temperature, "num_predict": max_new_tokens},
+            }
+        ).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
     try:
-        proc = subprocess.run(
-            ["ollama", "run", model],
-            input=payload,
-            text=True,
-            capture_output=True,
-            check=True,
-        )
-        return proc.stdout.strip()
+        with urllib.request.urlopen(req, timeout=180) as resp:
+            js = json.loads(resp.read().decode("utf-8"))
+        return (js.get("response") or "").strip() or "[EMPTY_RESPONSE]"
     except Exception as e:
-        return f"[ERROR calling ollama: {e}]"
+        return f"[ERROR calling ollama HTTP at {url}: {e}]"
 
 
 # ------------------------- scoring -------------------------
