@@ -35,6 +35,14 @@ from kv_lora_inject import (
     set_lora_enabled,
 )
 
+# If you applied the earlier runtime loader for generate.py, import it here too:
+try:
+    from kv_lora_inject import (
+        load_peft_adapter,
+    )  # optional; present if you applied previous patch
+except Exception:
+    load_peft_adapter = None
+
 # Wan imports live under the inference package.
 import sys
 
@@ -234,6 +242,14 @@ def _load_filtered_state(
     return state
 
 
+def _parse_step_from_filename(path: str) -> int:
+    import os
+    import re
+
+    m = re.search(r"step_(\d+)", os.path.basename(path))
+    return int(m.group(1)) if m else 0
+
+
 # -----------------------------------------------------------------------------
 # Main training routine
 # -----------------------------------------------------------------------------
@@ -277,8 +293,21 @@ def train(args: argparse.Namespace) -> None:
         print(f"[info] missing keys (not loaded): {len(missing)}")
     model.requires_grad_(False)
 
-    # inject LoRA modules
-    loras = inject_lora_kv(model, rank=args.rank, alpha=args.alpha)
+    # Inject LoRA modules (resume if adapter is provided)
+    if args.resume_adapter:
+        if load_peft_adapter is None:
+            raise RuntimeError(
+                "--resume_adapter was provided but load_peft_adapter is not available. Apply the kv_lora_inject.py loader patch."
+            )
+        loras = load_peft_adapter(
+            model,
+            path=args.resume_adapter,
+            prefix=args.adapter_prefix,
+            alpha=args.alpha,
+        )
+        print(f"[resume] loaded adapter: {args.resume_adapter}  (modules={len(loras)})")
+    else:
+        loras = inject_lora_kv(model, rank=args.rank, alpha=args.alpha)
     # Preflight: list injected modules
     print(f"[reports] writing to: {reports_root}")
     print(f"[lora] injected {len(loras)} modules:")
@@ -330,6 +359,19 @@ def train(args: argparse.Namespace) -> None:
 
     params = lora_parameters(model)
     optim = AdamW(params, lr=args.lr, weight_decay=0.0)
+    # Optionally resume optimizer
+    if args.resume_optimizer and os.path.exists(args.resume_optimizer):
+        state = torch.load(args.resume_optimizer, map_location="cpu")
+        sdict = state.get("state_dict", state)  # accept raw or wrapped
+        optim.load_state_dict(sdict)
+        print(f"[resume] loaded optimizer: {args.resume_optimizer}")
+
+    # Initial step (for numbering/checkpoint cadence)
+    steps_total = int(args.start_step) if args.start_step is not None else 0
+    if steps_total == 0 and args.resume_adapter:
+        steps_total = _parse_step_from_filename(args.resume_adapter)
+        if steps_total:
+            print(f"[resume] inferred start_step={steps_total} from adapter filename")
 
     ema = None
     ema_beta = 0.98  # smoothing
@@ -405,10 +447,18 @@ def train(args: argparse.Namespace) -> None:
                     args.out_dir, f"adapter_step_{steps_total:07d}.safetensors"
                 )
                 export_peft_adapter(model, ck_step, prefix=args.adapter_prefix)
+                opt_step = os.path.join(
+                    args.out_dir, f"optimizer_step_{steps_total:07d}.pt"
+                )
+                torch.save({"state_dict": optim.state_dict()}, opt_step)
                 shutil.copy2(
                     ck_step, os.path.join(args.out_dir, "adapter_latest.safetensors")
                 )
+                shutil.copy2(
+                    opt_step, os.path.join(args.out_dir, "optimizer_latest.pt")
+                )
                 print(f"[ckpt] wrote {ck_step}")
+                print(f"[ckpt] wrote {opt_step}")
                 # Optional sampling
                 if (
                     args.sample_every_steps > 0
@@ -466,14 +516,16 @@ def train(args: argparse.Namespace) -> None:
                 ck_ep, os.path.join(args.out_dir, "adapter_latest.safetensors")
             )
 
-    # save adapter
+    # save adapter + optimizer
     Path(args.out_dir).mkdir(parents=True, exist_ok=True)
-    out_path = os.path.join(args.out_dir, "adapter_model.safetensors")
-    # If your loader expects a different prefix, change it here (e.g., "transformer.")
+    out_path = os.path.join(args.out_dir, f"adapter_step_{steps_total:07d}.safetensors")
     export_peft_adapter(
         model, out_path, prefix=getattr(args, "adapter_prefix", "diffusion_model.")
     )
-    print(f"Saved adapter to {out_path}")
+    opt_path = os.path.join(args.out_dir, f"optimizer_step_{steps_total:07d}.pt")
+    torch.save({"state_dict": optim.state_dict()}, opt_path)
+    print(f"[ckpt] wrote {out_path}")
+    print(f"[ckpt] wrote {opt_path}")
     # final summary
     with open(os.path.join(reports_root, "summary.json"), "w", encoding="utf-8") as f:
         json.dump(
@@ -561,6 +613,25 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--use_normed_targets", action="store_true")
     p.add_argument(
         "--bf16", action="store_true", help="Use bfloat16 precision for encoders"
+    )
+    # Resume options
+    p.add_argument(
+        "--resume_adapter",
+        type=str,
+        default=None,
+        help="Path to adapter_step_*.safetensors to resume from.",
+    )
+    p.add_argument(
+        "--resume_optimizer",
+        type=str,
+        default=None,
+        help="Path to optimizer_step_*.pt to resume from (optional).",
+    )
+    p.add_argument(
+        "--start_step",
+        type=int,
+        default=None,
+        help="Global step to start numbering at (inferred from adapter filename if omitted).",
     )
     p.add_argument(
         "--adapter_prefix",
