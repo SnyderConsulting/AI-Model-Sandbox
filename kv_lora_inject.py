@@ -7,7 +7,7 @@ from typing import Dict, Iterable, List, Tuple
 
 import torch
 import torch.nn as nn
-from safetensors.torch import save_file as safetensors_save, safe_open
+from safetensors.torch import save_file as safetensors_save
 import math
 
 
@@ -158,76 +158,30 @@ def export_peft_adapter(
 # ---- Runtime loader (PEFT-ish) ----
 
 
-def _get_submodule(root: nn.Module, path: str) -> nn.Module:
-    """Traverse a dotted path like 'blocks.0.cross_attn.k'."""
-    mod = root
-    for part in path.split("."):
-        if part.isdigit():
-            mod = mod[int(part)]  # ModuleList / list
-        else:
-            mod = getattr(mod, part)
-    return mod
-
-
-def _set_submodule(root: nn.Module, path: str, new: nn.Module) -> None:
-    parts = path.split(".")
-    parent = root
-    for part in parts[:-1]:
-        parent = parent[int(part)] if part.isdigit() else getattr(parent, part)
-    setattr(parent, parts[-1], new)
-
-
 def load_peft_adapter(
     model: nn.Module,
     path: str,
     prefix: str = "diffusion_model.",
     alpha: float = 32.0,
-    dropout: float = 0.0,
-) -> Dict[str, LoRALinear]:
+):
     """
-    Load a KV-only LoRA adapter saved by export_peft_adapter(...).
-    Returns: dict mapping 'blocks.{i}.cross_attn.{k|v}' -> LoRALinear
+    Load LoRA weights into any existing LoRALinear modules on the model.
+    Assumes modules were already injected (or your model class builds them).
     """
-    # Read tensors
-    tensors: Dict[str, torch.Tensor] = {}
+    from safetensors.torch import safe_open
+
+    loras = {}
     with safe_open(path, framework="pt", device="cpu") as f:
-        for k in f.keys():
-            tensors[k] = f.get_tensor(k)
-
-    # Group by module path
-    groups: Dict[str, Dict[str, torch.Tensor]] = {}
-    for k, t in tensors.items():
-        if not k.startswith(prefix):
-            continue
-        tail = k[len(prefix) :]
-        if tail.endswith(".lora_A.weight"):
-            mpath = tail[: -len(".lora_A.weight")]
-            groups.setdefault(mpath, {})["A"] = t
-        elif tail.endswith(".lora_B.weight"):
-            mpath = tail[: -len(".lora_B.weight")]
-            groups.setdefault(mpath, {})["B"] = t
-
-    # Inject wrappers and load weights
-    loaded: Dict[str, LoRALinear] = {}
-    for mpath, parts in groups.items():
-        A = parts.get("A")
-        B = parts.get("B")
-        if A is None or B is None:
-            continue
-        rank = A.shape[1]
-        base = _get_submodule(model, mpath)
-        if isinstance(base, LoRALinear):
-            lora = base
-        else:
-            assert isinstance(
-                base, nn.Linear
-            ), f"Expected nn.Linear at {mpath}, got {type(base)}"
-            lora = LoRALinear(base, rank=rank, alpha=alpha, dropout=dropout)
-            _set_submodule(model, mpath, lora)
-        with torch.no_grad():
-            lora.lora_A.weight.copy_(A)
-            lora.lora_B.weight.copy_(B)
-            lora.enabled = True
-        loaded[mpath] = lora
-
-    return loaded
+        with torch.no_grad():  # avoid autograd in-place error
+            for name, module in model.named_modules():
+                if isinstance(module, LoRALinear):
+                    key_A = f"{prefix}{name}.lora_A.weight"
+                    key_B = f"{prefix}{name}.lora_B.weight"
+                    if key_A in f.keys() and key_B in f.keys():
+                        module.lora_A.weight.copy_(f.get_tensor(key_A))
+                        module.lora_B.weight.copy_(f.get_tensor(key_B))
+                        # ensure scaling matches runtime alpha
+                        module.alpha = alpha
+                        module.scaling = alpha / module.rank if module.rank > 0 else 0.0
+                        loras[name] = module
+    return loras
