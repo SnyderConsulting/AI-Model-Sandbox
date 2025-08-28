@@ -12,9 +12,12 @@ PEFT-compatible format.
 
 from __future__ import annotations
 
+import os
+
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import argparse
 import json
-import os
 import random
 import sys
 from pathlib import Path
@@ -257,13 +260,42 @@ def _parse_step_from_filename(path: str) -> int:
     return int(m.group(1)) if m else 0
 
 
+def _free_bridge_encoder(obj):
+    """Force-free VRAM held by BridgeEncoderModel's LLM (Accelerate-sharded)."""
+    try:
+        if hasattr(obj, "model") and hasattr(obj.model, "bridge"):
+            try:
+                obj.model.bridge.to("cpu")
+            except Exception:
+                pass
+        if hasattr(obj, "model") and hasattr(obj.model, "llm"):
+            obj.model.llm = None
+        if hasattr(obj, "llm"):
+            obj.llm = None
+    except Exception as e:  # pragma: no cover - best effort
+        print(f"[free_bridge] warning: {e}")
+    import gc  # local import to avoid global cuda init
+    import torch
+
+    torch.cuda.empty_cache()
+    gc.collect()
+
+
 def _release_training_gpu(*objs):
     for o in objs:
         try:
             getattr(o, "to", lambda *_a, **_k: None)("cpu")
         except Exception:
             pass
-    del objs
+        try:
+            if hasattr(o, "llm") and hasattr(o, "model"):
+                _free_bridge_encoder(o)
+        except Exception:
+            pass
+    import gc
+    import torch
+
+    torch.cuda.synchronize()
     torch.cuda.empty_cache()
     gc.collect()
 
@@ -273,6 +305,7 @@ def _rebuild_training(cfg, args):
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     from wan.modules.model import WanModel
 
+    torch.cuda.empty_cache()
     model = WanModel(**cfg).to(dev)
     filtered = _load_filtered_state(
         getattr(args, "transformer_weights_dir", None),
@@ -655,6 +688,13 @@ def train(args: argparse.Namespace) -> None:
                         print(f"[sample] failed to auto-sample: {e}")
                     finally:
                         if args.sample_pause_training:
+                            try:
+                                _free_bridge_encoder(bridge_enc)
+                            except Exception:
+                                pass
+                            del model, teacher_enc, bridge_enc, optim
+                            torch.cuda.empty_cache()
+                            gc.collect()
                             model, teacher_enc, bridge_enc, optim = _rebuild_training(
                                 cfg, args
                             )
