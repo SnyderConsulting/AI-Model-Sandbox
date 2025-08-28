@@ -498,7 +498,7 @@ def train(args: argparse.Namespace) -> None:
                             subprocess.run(shlex.split(cmd_base), env=env, check=False)
                             cmd_lora = (
                                 cmd_base
-                                + f' --kv_lora_adapter "{ck_step}" --kv_lora_prefix {args.adapter_prefix} --kv_lora_alpha {args.alpha}'
+                                + f' --lora_adapter_path "{ck_step}" --lora_alpha {args.alpha}'
                             )
                             cmd_lora = cmd_lora.replace("baseline.mp4", "lora.mp4")
                             subprocess.run(shlex.split(cmd_lora), env=env, check=False)
