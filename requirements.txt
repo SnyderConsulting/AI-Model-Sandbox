@@ -10,6 +10,7 @@ safetensors
 wandb
 tqdm
 numpy
+pandas
 bitsandbytes
 flash-attn==2.8.1
 scipy
