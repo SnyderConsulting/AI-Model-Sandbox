@@ -1,0 +1,17 @@
+{
+  "model_id": "goonsai-com/civitaiprompts/qwen2.5-3B-goonsai-nsfw-100k",
+  "total_params": 3397103616,
+  "dtype": "bfloat16",
+  "memory_fp16_bytes": 6794207232,
+  "memory_bf16_bytes": 6794207232,
+  "hidden_size": 2048,
+  "num_hidden_layers": 36,
+  "num_attention_heads": 16,
+  "num_key_value_heads": 2,
+  "head_dim": 128,
+  "intermediate_size": 11008,
+  "rms_norm_eps": 1e-06,
+  "rope_theta": 1000000.0,
+  "rope_scaling": null,
+  "vocab_size": 151936
+}

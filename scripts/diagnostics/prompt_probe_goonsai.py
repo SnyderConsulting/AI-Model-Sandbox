@@ -490,10 +490,10 @@ def main():
     ap.add_argument("--temperature", type=float, default=0.4)
     args = ap.parse_args()
 
-    tok = AutoTokenizer.from_pretrained(args.model, use_fast=True)
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model, torch_dtype=torch.bfloat16, device_map="auto"
-    )
+    model_id = "goonsai-com/civitaiprompts"
+    subfolder = "qwen2.5-3B-goonsai-nsfw-100k"
+    tok = AutoTokenizer.from_pretrained(model_id, subfolder=subfolder, use_fast=True)
+    model = AutoModelForCausalLM.from_pretrained(model_id, subfolder=subfolder, use_safetensors=True, torch_dtype=torch.bfloat16, device_map="auto")
 
     random.seed(args.seed)
     outdir = Path(args.outdir)
