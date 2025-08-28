@@ -94,11 +94,22 @@ def main():
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                 out = vl(
                     **inputs,
-                    output_hidden_states=False,
+                    output_hidden_states=True,
                     use_cache=False,
                     return_dict=True,
                 )
-            h = out.last_hidden_state.to(torch.bfloat16)
+            # Robustly get token embeddings for both causal LMs and Qwen-VL
+            h = getattr(out, "last_hidden_state", None)
+            if h is None:
+                hs = getattr(out, "hidden_states", None)
+                if hs is None:
+                    hs = getattr(out, "text_hidden_states", None)
+                if hs is None or len(hs) == 0:
+                    raise RuntimeError(
+                        "Model did not return hidden states; upgrade transformers or check model id."
+                    )
+                h = hs[-1]
+            h = h.to(torch.bfloat16)
             m = inputs["attention_mask"].bool()
             return h, m
 
@@ -121,9 +132,20 @@ def main():
             ).to(llm_model.device)
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                 llm_out = llm_model(
-                    **enc, output_hidden_states=False, use_cache=False, return_dict=True
+                    **enc, output_hidden_states=True, use_cache=False, return_dict=True
                 )
-            h = llm_out.last_hidden_state.to(torch.bfloat16)
+            # Robustly get token embeddings for both causal LMs and Qwen-VL
+            h = getattr(llm_out, "last_hidden_state", None)
+            if h is None:
+                hs = getattr(llm_out, "hidden_states", None)
+                if hs is None:
+                    hs = getattr(llm_out, "text_hidden_states", None)
+                if hs is None or len(hs) == 0:
+                    raise RuntimeError(
+                        "Model did not return hidden states; upgrade transformers or check model id."
+                    )
+                h = hs[-1]
+            h = h.to(torch.bfloat16)
             m = enc["attention_mask"].bool()
             return h, m
 
