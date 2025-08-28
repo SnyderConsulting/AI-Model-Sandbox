@@ -41,15 +41,8 @@ from kv_lora_inject import (
     inject_lora_kv,
     lora_parameters,
     set_lora_enabled,
+    load_peft_adapter,
 )
-
-# If you applied the earlier runtime loader for generate.py, import it here too:
-try:
-    from kv_lora_inject import (
-        load_peft_adapter,
-    )  # optional; present if you applied previous patch
-except Exception:
-    load_peft_adapter = None
 
 # Force the training process to use UMT5 as teacher, regardless of shell env
 os.environ["WAN_USE_BRIDGE"] = "0"
@@ -313,7 +306,26 @@ def _rebuild_training(cfg, args):
     )
     model.load_state_dict(filtered, strict=False)
     model.requires_grad_(False)
-    _ = inject_lora_kv(model, rank=args.rank, alpha=args.alpha)
+
+    def _inject_into(obj) -> dict:
+        return inject_lora_kv(
+            obj,
+            blocks_attr=getattr(args, "blocks_attr", "blocks"),
+            cross_attr=getattr(args, "cross_attr", "cross_attn"),
+            rank=args.rank,
+            alpha=args.alpha,
+            dropout=0.0,
+            blocks_range=None,
+        )
+
+    loras = _inject_into(model)
+    if len(loras) == 0 and hasattr(model, "diffusion_model"):
+        loras = _inject_into(model.diffusion_model)
+    if getattr(args, "verify_injection", False) and len(loras) == 0:
+        raise RuntimeError(
+            "LoRA injection found zero targets. "
+            "Check --blocks_attr/--cross_attr (defaults: blocks / cross_attn)."
+        )
 
     # Reload latest adapter
     latest_adapters = sorted(
@@ -347,6 +359,11 @@ def _rebuild_training(cfg, args):
 
     # Rebuild optimizer + reload
     params = lora_parameters(model)
+    if not params:
+        raise RuntimeError(
+            "No LoRA trainable parameters found (injection failed). "
+            "Confirm the model has `blocks.*.cross_attn.{k,v}` linears."
+        )
     optim = AdamW(params, lr=args.lr, weight_decay=0.0)
     latest_opt = sorted(glob(os.path.join(args.out_dir, "optimizer_step_*.pt")))
     if latest_opt:
@@ -450,28 +467,46 @@ def train(args: argparse.Namespace) -> None:
         print(f"[info] missing keys (not loaded): {len(missing)}")
     model.requires_grad_(False)
 
-    # Inject LoRA modules (resume if adapter is provided)
-    if args.resume_adapter:
-        if load_peft_adapter is None:
-            raise RuntimeError(
-                "--resume_adapter was provided but load_peft_adapter is not available. Apply the kv_lora_inject.py loader patch."
-            )
-        loras = load_peft_adapter(
-            model,
-            path=args.resume_adapter,
-            prefix=args.adapter_prefix,
+    # --- inject LoRA modules BEFORE loading any resume adapter -------------
+    def _inject_into(obj) -> dict:
+        return inject_lora_kv(
+            obj,
+            blocks_attr=getattr(args, "blocks_attr", "blocks"),
+            cross_attr=getattr(args, "cross_attr", "cross_attn"),
+            rank=args.rank,
             alpha=args.alpha,
+            dropout=0.0,
+            blocks_range=None,
         )
-        print(f"[resume] loaded adapter: {args.resume_adapter}  (modules={len(loras)})")
-    else:
-        loras = inject_lora_kv(model, rank=args.rank, alpha=args.alpha)
-    # Preflight: list injected modules
+
+    loras = _inject_into(model)
+    if len(loras) == 0 and hasattr(model, "diffusion_model"):
+        # Some Wan builds hang the transformer under .diffusion_model
+        loras = _inject_into(model.diffusion_model)
+
     print(f"[reports] writing to: {reports_root}")
     print(f"[lora] injected {len(loras)} modules:")
     for name in sorted(loras.keys())[:4]:
         print("   ", name)
     if len(loras) > 4:
         print("   ...")
+    if getattr(args, "verify_injection", False) and len(loras) == 0:
+        raise RuntimeError(
+            "LoRA injection found zero targets. "
+            "Check --blocks_attr/--cross_attr (defaults: blocks / cross_attn)."
+        )
+
+    # --- optionally load a resume adapter now that wrappers exist ----------
+    if getattr(args, "resume_adapter", None):
+        loaded = load_peft_adapter(
+            model,
+            path=args.resume_adapter,
+            prefix=args.adapter_prefix,
+            alpha=args.alpha,
+        )
+        print(
+            f"[resume] loaded adapter: {args.resume_adapter}  (modules={len(loaded)})"
+        )
 
     # --- encoders ---------------------------------------------------------
     # robust text length getter
@@ -515,6 +550,11 @@ def train(args: argparse.Namespace) -> None:
     )
 
     params = lora_parameters(model)
+    if not params:
+        raise RuntimeError(
+            "No LoRA trainable parameters found (injection failed). "
+            "Confirm the model has `blocks.*.cross_attn.{k,v}` linears."
+        )
     optim = AdamW(params, lr=args.lr, weight_decay=0.0)
     optim.zero_grad(set_to_none=True)
     # Optionally resume optimizer
@@ -839,6 +879,23 @@ def build_argparser() -> argparse.ArgumentParser:
         type=str,
         default="diffusion_model.",
         help="Key prefix when exporting LoRA adapter (e.g., diffusion_model. or transformer.)",
+    )
+    p.add_argument(
+        "--blocks_attr",
+        type=str,
+        default="blocks",
+        help="Model attribute containing transformer blocks (default: blocks).",
+    )
+    p.add_argument(
+        "--cross_attr",
+        type=str,
+        default="cross_attn",
+        help="Attribute name for cross-attention modules (default: cross_attn).",
+    )
+    p.add_argument(
+        "--verify_injection",
+        action="store_true",
+        help="Error if LoRA injection finds zero target modules.",
     )
     p.add_argument(
         "--save_every_steps",
