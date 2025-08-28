@@ -224,6 +224,8 @@ def _parse_args():
     # KV-LoRA adapter support
     parser.add_argument(
         "--lora_adapter_path",
+        "--lora_adapter",
+        dest="lora_adapter_path",
         type=str,
         default=None,
         help="Path to KV-LoRA adapter .safetensors (cross_attn K/V).",
@@ -285,29 +287,43 @@ def _init_logging(rank):
 
 
 def _maybe_load_kv_lora(pipeline, args, logger):
+    """Inject and load KV-LoRA into the Wan transformer inside the pipeline."""
     if not args.lora_adapter_path:
         return
     if load_peft_adapter is None or inject_lora_kv is None:
         logger.warning("kv_lora_inject not available; skipping --lora_adapter_path.")
         return
+
+    # 1) Find the WanModel (has .blocks[..].cross_attn.{k,v})
     target = getattr(pipeline, "dit", None) or getattr(pipeline, "model", None)
     if target is None:
-        logger.warning(
-            "Could not locate underlying DiT (no .dit or .model); skipping --lora_adapter_path."
-        )
+        logger.warning("No .dit/.model found on pipeline; cannot apply LoRA.")
         return
+    # WanModel in training exposed .blocks directly; some builds wrap it in .diffusion_model.
     base = getattr(target, "diffusion_model", None)
+    if base is None and hasattr(target, "blocks"):
+        base = target
     if base is None:
-        logger.warning("Target has no diffusion_model; skipping --lora_adapter_path.")
+        # Heuristic fallback: walk submodules to find something with .blocks
+        for _, m in target.named_modules():
+            if hasattr(m, "blocks"):
+                base = m
+                break
+    if base is None:
+        logger.warning("Could not locate a transformer with `.blocks`; skipping LoRA.")
         return
-    inject_lora_kv(base, rank=8, alpha=args.lora_alpha)
-    load_peft_adapter(
-        target,
+
+    # 2) Inject LoRA wrappers then load weights
+    loras = inject_lora_kv(base, rank=8, alpha=args.lora_alpha)
+    loaded = load_peft_adapter(
+        base,
         path=args.lora_adapter_path,
         prefix="diffusion_model.",
         alpha=args.lora_alpha,
     )
-    logger.info(f"Loaded KV-LoRA adapter: {args.lora_adapter_path}")
+    logger.info(
+        f"Injected {len(loras)} KV-LoRA modules; loaded {len(loaded)} from {args.lora_adapter_path}"
+    )
 
 
 def generate(args):
