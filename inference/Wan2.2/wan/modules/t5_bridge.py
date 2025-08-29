@@ -7,13 +7,27 @@ from typing import List, Optional, Union
 
 import torch
 import torch.nn as nn
-from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
+from transformers import AutoTokenizer, AutoModelForCausalLM, AutoProcessor
 
-try:  # optional VL support
-    from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
-except Exception:  # pragma: no cover - missing optional deps
-    AutoProcessor = None
+try:
+    from transformers import Qwen2_5_VLForConditionalGeneration
+except Exception:
     Qwen2_5_VLForConditionalGeneration = None
+
+
+def _sanitize_texts(texts):
+    clean = []
+    for t in texts:
+        if not isinstance(t, str):
+            t = str(t)
+        t = (
+            t.encode("utf-8", "ignore")
+            .decode("utf-8", "ignore")
+            .replace("\x00", "")
+            .strip()
+        )
+        clean.append(t)
+    return clean
 
 
 # ------------------------ utils ------------------------
@@ -184,24 +198,23 @@ class BridgeEncoderModel:
                 "WAN_BRIDGE_CKPT must point to a valid bridge checkpoint (*.pth)."
             )
 
-        # --- load LLM (tokenizer + model) ---
-        cfg = AutoConfig.from_pretrained(self.llm_dir)
-        mt = getattr(cfg, "model_type", "")
-        is_vl = "qwen2_vl" in mt or "qwen2_5_vl" in mt
-
+        # --- load LLM (tokenizer/processor + model) ---
+        self.is_vl = False
         device_map = "auto" if self.device.type == "cuda" else None
-        if is_vl and AutoProcessor and Qwen2_5_VLForConditionalGeneration:
-            self.tok = AutoProcessor.from_pretrained(self.llm_dir)
-            self.llm = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-                self.llm_dir, torch_dtype=self.dtype, device_map=device_map
-            )
-            self._encode = "vl"
-        else:
+        if Qwen2_5_VLForConditionalGeneration is not None:
+            try:
+                self.proc = AutoProcessor.from_pretrained(self.llm_dir)
+                self.llm = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                    self.llm_dir, torch_dtype=self.dtype, device_map=device_map
+                )
+                self.is_vl = True
+            except Exception:
+                pass
+        if not self.is_vl:
             self.tok = AutoTokenizer.from_pretrained(self.llm_dir, use_fast=True)
             self.llm = AutoModelForCausalLM.from_pretrained(
                 self.llm_dir, torch_dtype=self.dtype, device_map=device_map
             )
-            self._encode = "causal"
         self.llm.eval().requires_grad_(False)
 
         d_llm = getattr(self.llm.config, "hidden_size", None)
@@ -307,9 +320,17 @@ class BridgeEncoderModel:
         out_device = (
             _resolve_device(device, False) if device is not None else self.device
         )
+        texts = _sanitize_texts(texts)
 
-        if self._encode == "vl":
-            inputs = self.tok(
+        try:
+            llm_in_device = next(self.llm.parameters()).device
+        except StopIteration:
+            llm_in_device = self._llm_in_device
+
+        inputs = None
+        enc = None
+        if self.is_vl:
+            inputs = self.proc(
                 text=texts,
                 images=None,
                 videos=None,
@@ -318,19 +339,11 @@ class BridgeEncoderModel:
                 truncation=True,
                 max_length=self.llm_max,
             )
-            try:
-                llm_in_device = next(self.llm.parameters()).device
-            except StopIteration:
-                llm_in_device = self._llm_in_device
             inputs = {
                 k: (v.to(llm_in_device) if hasattr(v, "to") else v)
                 for k, v in inputs.items()
             }
-            out = self.llm(
-                **inputs, output_hidden_states=True, use_cache=False, return_dict=True
-            )
-            h_llm = out.hidden_states[-1]
-            m_llm = inputs["attention_mask"].bool()
+            out = self.llm(**inputs, output_hidden_states=True, use_cache=False)
         else:
             enc = self.tok(
                 texts,
@@ -338,17 +351,13 @@ class BridgeEncoderModel:
                 padding=True,
                 truncation=True,
                 max_length=self.llm_max,
-            )
-            try:
-                llm_in_device = next(self.llm.parameters()).device
-            except StopIteration:
-                llm_in_device = self._llm_in_device
-            enc = enc.to(llm_in_device)
-            out = self.llm(
-                **enc, output_hidden_states=True, use_cache=False, return_dict=True
-            )
-            h_llm = out.hidden_states[-1]
-            m_llm = enc["attention_mask"].bool()
+            ).to(llm_in_device)
+            out = self.llm(**enc, output_hidden_states=True, use_cache=False)
+
+        h_llm = out.hidden_states[-1]
+        m_llm = (
+            inputs["attention_mask"] if self.is_vl else enc["attention_mask"]
+        ).bool()
 
         # Run the bridge on *its current* device
         try:
