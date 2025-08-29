@@ -90,7 +90,7 @@ def inject_lora_kv(
     model: nn.Module,
     blocks_attr: str = "blocks",
     cross_attr: str = "cross_attn",
-    targets: Tuple[str, ...] = ("k", "v"),
+    targets: Tuple[str, ...] = ("q", "k", "v", "o"),
     rank: int = 8,
     alpha: float = 32.0,
     dropout: float = 0.0,

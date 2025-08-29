@@ -69,3 +69,8 @@ inference/Wan2.2/examples/
 *.log
 wandb/
 logs/
+
+
+.idea
+.DS_Store
+*/.DS_Store

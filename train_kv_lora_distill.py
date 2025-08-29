@@ -41,7 +41,7 @@ from kv_lora_inject import (
     inject_lora_kv,
     lora_parameters,
     set_lora_enabled,
-    load_peft_adapter,
+    load_peft_adapter, LoRALinear,
 )
 
 # Force the training process to use UMT5 as teacher, regardless of shell env
@@ -312,6 +312,7 @@ def _rebuild_training(cfg, args):
             obj,
             blocks_attr=getattr(args, "blocks_attr", "blocks"),
             cross_attr=getattr(args, "cross_attr", "cross_attn"),
+            targets= tuple([s.strip() for s in args.inject_targets.split(",") if s.strip()]),
             rank=args.rank,
             alpha=args.alpha,
             dropout=0.0,
@@ -359,6 +360,16 @@ def _rebuild_training(cfg, args):
 
     # Rebuild optimizer + reload
     params = lora_parameters(model)
+    train_targets = set([s.strip() for s in args.train_targets.split(",") if s.strip()])
+    params = []
+    for name, module in model.named_modules():
+        if isinstance(module, LoRALinear):
+            if any(name.endswith(f".{t}") for t in train_targets):
+                params.extend(list(module.trainable_parameters()))
+            else:
+                for p in module.trainable_parameters():
+                    p.requires_grad_(False)
+
     if not params:
         raise RuntimeError(
             "No LoRA trainable parameters found (injection failed). "
@@ -473,6 +484,7 @@ def train(args: argparse.Namespace) -> None:
             obj,
             blocks_attr=getattr(args, "blocks_attr", "blocks"),
             cross_attr=getattr(args, "cross_attr", "cross_attn"),
+            targets=("k", "v"),
             rank=args.rank,
             alpha=args.alpha,
             dropout=0.0,
@@ -969,6 +981,10 @@ def build_argparser() -> argparse.ArgumentParser:
             "Optional path for reports/; defaults to reports/dit_lora_translator/<timestamp>."
         ),
     )
+    p.add_argument("--inject_targets", type=str, default="k,v",
+                   help="Comma-separated list from {q,k,v,o} to inject LoRA modules for.")
+    p.add_argument("--train_targets", type=str, default="k,v",
+                   help="Comma-separated list from {q,k,v,o} to actually optimize in this script.")
     return p
 
 
