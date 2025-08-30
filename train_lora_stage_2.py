@@ -66,14 +66,20 @@ def build_argparser():
     p.add_argument(
         "--vae_dir",
         type=str,
-        default=os.environ.get("WAN_VAE_DIR", None),
-        help="Folder containing Wan VAE weights.",
+        default=None,
+        help="Folder that contains 'wan/' (e.g., .../inference/Wan2.2).",
+    )
+    p.add_argument(
+        "--vae_module",
+        type=str,
+        default=None,
+        help="Python module for Wan VAE, e.g. 'wan.modules.vae3d' or 'wan.modules.vae'.",
     )
     p.add_argument(
         "--vae_ckpt",
         type=str,
-        default=os.environ.get("WAN_VAE_CKPT", None),
-        help="Path to Wan VAE .safetensors checkpoint.",
+        default=None,
+        help="Path to Wan VAE weights (.pth or .safetensors).",
     )
     p.add_argument("--text_len", type=int, default=512)
 
@@ -339,7 +345,9 @@ def main(args):
     model.requires_grad_(False)
 
     # build/load VAE explicitly (Wan keeps it separate from the DiT)
-    vae = load_wan_vae(args.vae_ckpt or args.vae_dir, device=device, dtype=dtype)
+    vae = load_wan_vae(
+        args.vae_dir, args.vae_module, args.vae_ckpt, device=device, dtype=dtype
+    )
 
     # Inject LoRA into cross-attn targets (default q/k/v/o)
     targets = tuple([s.strip() for s in args.targets.split(",") if s.strip()])
