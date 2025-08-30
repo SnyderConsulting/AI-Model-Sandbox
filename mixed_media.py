@@ -1,7 +1,11 @@
 from __future__ import annotations
-import os, re, math, random, pathlib
+import math
+import os
+import pathlib
+import random
+import re
 from dataclasses import dataclass
-from typing import List, Tuple, Dict, Optional
+from typing import Dict, List, Tuple
 import torch
 from torch.utils.data import Dataset, Sampler
 from torchvision.io import read_image, ImageReadMode, read_video
@@ -26,19 +30,25 @@ def _caption_path(stem: str) -> str:
     return alt if os.path.exists(alt) else ""
 
 
-def _infer_frames_from_path(path: str, default_frames: List[int]) -> int:
-    # Expect folder names like ".../17frames", ".../33frames"
+def _infer_frames_from_path(path: str, allowed: List[int]) -> int:
+    """Pick a frame count from the path or the closest allowed value."""
     m = re.search(r"(\d+)frames", path.replace("\\", "/"))
     if m:
-        return int(m.group(1))
-    return default_frames[-1]  # fallback for videos placed directly in 480p/720p
+        try:
+            want = int(m.group(1))
+            if want in allowed:
+                return want
+        except Exception:
+            pass
+    vids = [x for x in allowed if x != 1]
+    return min(vids, key=lambda v: abs(v - 17)) if vids else 17
 
 
 def _norm_to_range(x: torch.Tensor) -> torch.Tensor:
-    # uint8 -> float32 in [-1,1]
+    # uint8 -> float32 in [0,1]
     if x.dtype != torch.float32:
         x = x.float()
-    return (x / 255.0) * 2.0 - 1.0
+    return x / 255.0
 
 
 class MixedCaptioned(Dataset):
@@ -125,7 +135,7 @@ class MixedCaptioned(Dataset):
         return len(self.samples)
 
     def _resize_and_crop(self, x: torch.Tensor, target: int) -> torch.Tensor:
-        # x: [C,H,W], uint8 or float; output float32 in [-1,1]; square or keep aspect, shortest side -> target
+        # x: [C,H,W], uint8 or float; output float32 in [0,1]; square or keep aspect, shortest side -> target
         C, H, W = x.shape
         # make shortest side == target, keep aspect
         scale = target / min(H, W)
@@ -148,7 +158,7 @@ class MixedCaptioned(Dataset):
         return _norm_to_range(x)
 
     def _load_image_tensor(self, path: str, target: int) -> torch.Tensor:
-        # returns [T=1, 3, H, W] normalized [-1,1]
+        # returns [T=1, 3, H, W] normalized [0,1]
         im = read_image(path, mode=ImageReadMode.RGB)  # [3,H,W], uint8
         im = self._resize_and_crop(im, target)
         return im.unsqueeze(0)  # [1,3,H,W]
@@ -173,7 +183,7 @@ class MixedCaptioned(Dataset):
         out = []
         for i in range(frames.size(0)):
             out.append(self._resize_and_crop(frames[i], target))  # [3,h,w]
-        return torch.stack(out, dim=0)  # [T,3,h,w] in [-1,1]
+        return torch.stack(out, dim=0)  # [T,3,h,w] in [0,1]
 
     def __getitem__(self, idx):
         s = self.samples[idx]
@@ -185,7 +195,7 @@ class MixedCaptioned(Dataset):
         else:
             x = self._load_image_tensor(s.path, s.res)  # [1,3,h,w]
         return dict(
-            pixel=x,  # normalized [-1,1]
+            pixel=x,  # normalized [0,1]
             caption=caption,
             res=s.res,
             frames=s.frames,
