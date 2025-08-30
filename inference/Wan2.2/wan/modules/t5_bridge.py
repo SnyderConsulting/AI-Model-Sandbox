@@ -203,9 +203,14 @@ class BridgeEncoderModel:
         device_map = "auto" if self.device.type == "cuda" else None
         if Qwen2_5_VLForConditionalGeneration is not None:
             try:
-                self.proc = AutoProcessor.from_pretrained(self.llm_dir)
+                self.proc = AutoProcessor.from_pretrained(
+                    self.llm_dir, trust_remote_code=True
+                )
                 self.llm = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-                    self.llm_dir, torch_dtype=self.dtype, device_map=device_map
+                    self.llm_dir,
+                    torch_dtype=self.dtype,
+                    device_map=device_map,
+                    trust_remote_code=True,
                 )
                 self.is_vl = True
             except Exception:

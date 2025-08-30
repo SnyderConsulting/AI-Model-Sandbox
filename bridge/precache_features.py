@@ -70,9 +70,12 @@ def main():
     )
     if is_vl and AutoProcessor and Qwen2_5_VLForConditionalGeneration:
         print("[precache] loading LLM (Qwen-VL)…")
-        proc = AutoProcessor.from_pretrained(args.llm_dir)
+        proc = AutoProcessor.from_pretrained(args.llm_dir, trust_remote_code=True)
         vl = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            args.llm_dir, torch_dtype=torch.bfloat16, device_map="auto"
+            args.llm_dir,
+            torch_dtype=torch.bfloat16,
+            device_map="auto",
+            trust_remote_code=True,
         )
         vl.eval().requires_grad_(False)
 
