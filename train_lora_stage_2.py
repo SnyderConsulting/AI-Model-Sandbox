@@ -274,13 +274,32 @@ def _norm_to_neg1_pos1(x: torch.Tensor) -> torch.Tensor:
     return x.mul_(2.0).sub_(1.0)
 
 
+def _to_bthwc(x: torch.Tensor) -> torch.Tensor:
+    """
+    Normalize pixel tensor layouts to [B, T, H, W, C].
+    Accepts BTCHW, BTHWC, BCHW, BHWC.
+    """
+    if x.dim() == 5:
+        # BTCHW -> BTHWC
+        if x.size(2) in (1, 3):
+            return x.permute(0, 1, 3, 4, 2).contiguous()
+        # already BTHWC
+        if x.size(-1) in (1, 3):
+            return x.contiguous()
+    elif x.dim() == 4:
+        # BCHW -> BTHWC (T=1)
+        if x.size(1) in (1, 3):
+            return x.permute(0, 2, 3, 1).unsqueeze(1).contiguous()
+        # BHWC -> BTHWC (T=1)
+        if x.size(-1) in (1, 3):
+            return x.unsqueeze(1).contiguous()
+    raise AssertionError(f"Unexpected pixel tensor shape {tuple(x.shape)}; expected BCHW/BTCHW/BHWC/BTHWC.")
+    
+    
 @torch.no_grad()
-def encode_pixels_to_latents(vae, pixels_bthwc_or_bchw: torch.Tensor) -> torch.Tensor:
-    """
-    pixels: [B,T,H,W,3] or [B,3,H,W] in [-1,1]
-    returns: [B, F, C, H', W']
-    """
-    return vae.encode(pixels_bthwc_or_bchw)
+def encode_pixels_to_latents(vae, pixels):
+    x = _to_bthwc(pixels)
+    return vae.encode(x)
 
 
 def parse_allowed_frames(arg: str) -> List[int]:
