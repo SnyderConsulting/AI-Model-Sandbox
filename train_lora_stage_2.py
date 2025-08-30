@@ -236,50 +236,47 @@ def _apply_filtered_state(model: nn.Module, state: Dict[str, torch.Tensor]) -> N
         print("unexpected:", unexpected)
 
 
-def call_dit(model, x_t, t, context, mask):
+# drop-in replacement for call_dit()
+
+def call_dit(model, x_t, t, context, mask=None):
     """
-    Normalizes shapes and calls Wan DiT with the required seq_len argument.
-    Accepts x_t as [B,S,C,H,W] (video) or [B,C,H,W] (image).
+    Feed Wan DiT with a 5D tensor [B, C, T, H, W].
+    Accepts x_t as:
+      - [B, T, C, H, W]
+      - [B, C, T, H, W]
+      - [B, C, H, W]  (T=1)
+    Automatically sets seq_len=T. (This build does not accept 'mask'.)
     """
-    device = x_t.device
+    import torch
 
     if x_t.dim() == 5:
-        B, S, C, H, W = x_t.shape
-        x_in = x_t.reshape(B * S, C, H, W)   # flatten sequences into batch
-        seq_len = S
-        bs = B * S
+        # If third dim looks like channels (common: 16 or 48), interpret as [B,T,C,H,W] -> [B,C,T,H,W]
+        if x_t.size(2) in (1, 3, 16, 48):
+            B, T, C, H, W = x_t.shape
+            x5 = x_t.permute(0, 2, 1, 3, 4).contiguous()  # [B,C,T,H,W]
+            seq_len = T
+        else:
+            # Already [B,C,T,H,W]
+            B, C, T, H, W = x_t.shape
+            x5 = x_t.contiguous()
+            seq_len = T
     elif x_t.dim() == 4:
+        # [B,C,H,W] -> [B,C,1,H,W]
         B, C, H, W = x_t.shape
-        x_in = x_t
+        x5 = x_t.unsqueeze(2).contiguous()
         seq_len = 1
-        bs = B
     else:
         raise AssertionError(f"Unexpected latent shape {tuple(x_t.shape)}")
 
-    # Normalize timestep tensor to match flattened batch
-    if t.ndim == 0:
-        t = t.view(1).repeat(bs)
-    elif t.shape[0] == B and seq_len > 1:
-        t = t.repeat_interleave(seq_len)
-    elif t.shape[0] != bs:
-        t = t.reshape(-1)[:1].repeat(bs)
-    t = t.to(device)
+    # Ensure timestep shape is [B]
+    t = t.reshape(-1).to(x5.device)
+    if t.numel() == 1:
+        t = t.repeat(B)
+    elif t.numel() != B:
+        t = t[:B]
 
-    # Optional mask -> [B, S] on correct device (if provided)
-    m = None
-    if mask is not None:
-        m = mask.to(device)
-        if x_t.dim() == 5:
-            if m.dim() == 1:
-                m = m.view(B, seq_len)
-            elif m.dim() == 2 and m.shape[1] != seq_len:
-                m = m[:, :seq_len]
+    return model(x5, t, context, seq_len=seq_len)
 
-    # Some Wan builds require seq_len and may/may not accept mask kwarg.
-    try:
-        return model(x_in, t, context, seq_len=seq_len, mask=m)
-    except TypeError:
-        return model(x_in, t, context, seq_len=seq_len)
 
 
 @torch.no_grad()
