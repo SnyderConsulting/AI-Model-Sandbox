@@ -7,7 +7,7 @@ from typing import List, Optional, Union
 
 import torch
 import torch.nn as nn
-from transformers import AutoTokenizer, AutoModelForCausalLM, AutoProcessor
+from transformers import AutoProcessor
 
 try:
     from transformers import Qwen2_5_VLForConditionalGeneration
@@ -200,7 +200,13 @@ class BridgeEncoderModel:
 
         # --- load LLM (tokenizer/processor + model) ---
         self.is_vl = False
-        device_map = "auto" if self.device.type == "cuda" else None
+        device_map = "auto" if self.device.type == "cuda" else {"": "cpu"}
+        force_vl = os.environ.get("WAN_BRIDGE_FORCE_VL", "1").lower() not in (
+            "0",
+            "false",
+            "no",
+        )
+
         if Qwen2_5_VLForConditionalGeneration is not None:
             try:
                 self.proc = AutoProcessor.from_pretrained(
@@ -210,16 +216,36 @@ class BridgeEncoderModel:
                     self.llm_dir,
                     torch_dtype=self.dtype,
                     device_map=device_map,
+                    low_cpu_mem_usage=True,
                     trust_remote_code=True,
                 )
                 self.is_vl = True
-            except Exception:
-                pass
+            except Exception as e:
+                if force_vl:
+                    print(
+                        "[BridgeEncoderModel] Qwen2.5-VL load failed; refusing to fall back because "
+                        "WAN_BRIDGE_FORCE_VL is set. Full error:"
+                    )
+                    raise
+                else:
+                    print(
+                        f"[BridgeEncoderModel] Qwen2.5-VL load failed ({e}). Falling back to AutoModelForCausalLM."
+                    )
+
         if not self.is_vl:
-            self.tok = AutoTokenizer.from_pretrained(self.llm_dir, use_fast=True)
-            self.llm = AutoModelForCausalLM.from_pretrained(
-                self.llm_dir, torch_dtype=self.dtype, device_map=device_map
+            from transformers import AutoTokenizer, AutoModelForCausalLM
+
+            self.tok = AutoTokenizer.from_pretrained(
+                self.llm_dir, use_fast=True, trust_remote_code=True
             )
+            self.llm = AutoModelForCausalLM.from_pretrained(
+                self.llm_dir,
+                torch_dtype=self.dtype,
+                device_map=device_map,
+                low_cpu_mem_usage=True,
+                trust_remote_code=True,
+            )
+
         self.llm.eval().requires_grad_(False)
 
         d_llm = getattr(self.llm.config, "hidden_size", None)
@@ -244,15 +270,16 @@ class BridgeEncoderModel:
 
         ckpt = torch.load(self.ckpt_path, map_location="cpu")
         sd = ckpt.get("bridge", ckpt)
-        w = sd.get("in_proj.weight", None)
-        if w is not None:
-            d_llm_ckpt = w.shape[1]
-            d_llm_live = getattr(self.llm.config, "hidden_size", None)
-            if d_llm_live != d_llm_ckpt:
+
+        # If the bridge was saved as raw module weights, pick a canonical key:
+        in_keys = [k for k in sd.keys() if k.endswith("in_proj.weight")]
+        if in_keys:
+            ckpt_d_llm = sd[in_keys[0]].shape[1]
+            if ckpt_d_llm != d_llm:
                 raise RuntimeError(
-                    f"Bridge/LLM mismatch: ckpt expects d_llm={d_llm_ckpt} but loaded LLM has d_llm={d_llm_live}. "
-                    "Fix by (A) installing transformers/qwen-vl-utils so Qwen2_5_VL loads, or "
-                    "(B) retraining the bridge for the current LLM dimension."
+                    f"Bridge/LLM hidden_size mismatch: bridge expects d_llm={ckpt_d_llm}, "
+                    f"but loaded LLM has d_llm={d_llm}. "
+                    "This is almost always due to falling back to a CausalLM or pointing to the wrong LLM repo."
                 )
         missing, unexpected = self.bridge.load_state_dict(sd, strict=False)
         if missing or unexpected:
