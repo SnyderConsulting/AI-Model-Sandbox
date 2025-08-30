@@ -13,51 +13,19 @@ Stage-2 LoRA trainer for Wan DiT cross-attention (Q/K/V/O) on captioned image+vi
 """
 
 from __future__ import annotations
-import glob
 import json
 import os
 import random
 import sys
-from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Tuple, Optional, Dict
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
-from torchvision.io import read_image, ImageReadMode
-from torchvision.io import read_video  # fallback video decoder
-from torchvision.transforms.functional import resize, center_crop
-
-# ---- torchvision dtype shim (works across torchvision versions) ----
-try:
-    # Newer builds may have to_dtype; keep its behavior if present.
-    from torchvision.transforms.functional import to_dtype as _tv_to_dtype
-
-    def to_dtype(img, dtype, scale: bool = True):
-        # mirror the signature we use later in the file
-        return _tv_to_dtype(img, dtype=dtype, scale=scale)
-
-except Exception:
-    # Fallback for common builds: use convert_image_dtype (scales ints->[0,1] when going to float)
-    from torchvision.transforms.functional import (
-        convert_image_dtype as _convert_image_dtype,
-    )
-    import torch
-
-    def to_dtype(img, dtype, scale: bool = True):
-        # If we're converting integer tensors to float and scale=True, convert_image_dtype
-        # will scale to [0,1]. If scale=False, just cast.
-        if scale:
-            return _convert_image_dtype(img, dtype)
-        else:
-            return img.to(dtype)
-
-
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-# ---- local imports
 from kv_lora_inject import (
     inject_lora_kv,
     set_lora_enabled,
@@ -66,6 +34,7 @@ from kv_lora_inject import (
     export_peft_adapter,
     LoRALinear,
 )
+from mixed_media import MixedCaptioned, BucketBatchSampler
 
 # --- Configuration / args
 import argparse
@@ -140,28 +109,25 @@ def build_argparser():
         required=True,
         help="Root folder (contains /image, /video).",
     )
-    p.add_argument("--use_480p", action="store_true")
-    p.add_argument("--use_720p", action="store_true")
+    p.add_argument(
+        "--resolutions",
+        type=str,
+        default="480,720",
+        help="Comma list of resolutions to include (e.g. 480,720).",
+    )
     p.add_argument(
         "--frames",
         type=str,
-        default="17,33,49,65,81",
-        help="Which frame-count folders to include for videos.",
+        default="1,17",
+        help="Which frame-count buckets to include (must include 1 for images).",
     )
     p.add_argument(
-        "--max_samples",
+        "--base_batch",
         type=int,
-        default=None,
-        help="Optional cap on total samples (images+videos).",
+        default=16,
+        help="Reference batch size for 480p images; other buckets scale from this.",
     )
-    p.add_argument("--shuffle", action="store_true")
-    p.add_argument(
-        "--batch_size",
-        type=int,
-        default=1,
-        help="Batch size in videos usually must be small.",
-    )
-    p.add_argument("--num_workers", type=int, default=4)
+    p.add_argument("--workers", type=int, default=4, help="DataLoader workers.")
 
     # Training
     p.add_argument("--steps", type=int, default=20000)
@@ -196,154 +162,6 @@ def _import_wan22():
     from wan.modules.t5_bridge import BridgeEncoderModel  # type: ignore
 
     return WanModel, BridgeEncoderModel
-
-
-# ---- Data helpers
-
-
-def _read_caption(txt_path: str) -> str:
-    try:
-        with open(txt_path, "r", encoding="utf-8") as f:
-            t = f.read().strip()
-            return t if t else " "
-    except Exception:
-        return " "
-
-
-def _norm_to_minus1_1(t: torch.Tensor) -> torch.Tensor:
-    # t in [0,1] float -> [-1,1]
-    return t * 2.0 - 1.0
-
-
-def _load_image(path: str, side: int) -> torch.Tensor:
-    # returns [T=1, H, W, C]
-    img = read_image(path, mode=ImageReadMode.RGB)  # [3,H,W], uint8
-    img = to_dtype(img, torch.float32, scale=True)  # -> [0,1]
-    # make square crop to preserve aspect before resizing (Wan uses fixed res)
-    H, W = img.shape[1], img.shape[2]
-    s = min(H, W)
-    img = center_crop(img, [s, s])
-    img = resize(img, [side, side], antialias=True)
-    img = img.permute(1, 2, 0).contiguous()  # [H,W,3]
-    img = _norm_to_minus1_1(img)
-    return img.unsqueeze(0)  # [1,H,W,3]
-
-
-def _ensure_nframes(frames: torch.Tensor, target_T: int) -> torch.Tensor:
-    # frames: [T,H,W,3] in [-1,1]
-    T = frames.shape[0]
-    if T == target_T:
-        return frames
-    if T > target_T:
-        # uniform downsample
-        idx = torch.linspace(0, T - 1, target_T).round().long()
-        return frames.index_select(0, idx)
-    # pad last frame
-    last = frames[-1:].repeat(target_T - T, 1, 1, 1)
-    return torch.cat([frames, last], dim=0)
-
-
-def _load_video(path: str, side: int, target_T: int) -> torch.Tensor:
-    # returns [T,H,W,3]
-    # Note: torchvision.io.read_video returns T,H,W,C in uint8 (or float)
-    vframes, _, _ = read_video(path, pts_unit="sec")
-    vframes = to_dtype(vframes, torch.float32, scale=True)  # [T,H,W,3] in [0,1]
-    # center-crop shortest side then resize square
-    H, W = int(vframes.shape[1]), int(vframes.shape[2])
-    s = min(H, W)
-    top = (H - s) // 2
-    left = (W - s) // 2
-    vframes = vframes[:, top : top + s, left : left + s, :]
-    # resize per-frame
-    vframes = torch.stack(
-        [
-            resize(f.permute(2, 0, 1), [side, side], antialias=True).permute(1, 2, 0)
-            for f in vframes
-        ],
-        dim=0,
-    )
-    vframes = _norm_to_minus1_1(vframes)
-    vframes = _ensure_nframes(vframes, target_T)
-    return vframes  # [T,H,W,3]
-
-
-@dataclass
-class MediaSample:
-    kind: str  # "image" or "video"
-    path: str
-    caption: str
-    reso: int  # 480 or 720
-    frames: int  # 1 for images, else one of {17,33,49,65,81}
-
-
-class MediaDataset(Dataset):
-    def __init__(
-        self,
-        root: str,
-        use_480p: bool,
-        use_720p: bool,
-        frames_list: List[int],
-        max_samples: Optional[int] = None,
-        shuffle: bool = False,
-    ):
-        root = Path(root)
-        items: List[MediaSample] = []
-
-        def scan_img(reso: int):
-            d = root / "image" / f"{reso}p"
-            for img in glob.glob(str(d / "*")):
-                if os.path.splitext(img)[1].lower() not in (
-                    ".png",
-                    ".jpg",
-                    ".jpeg",
-                    ".bmp",
-                    ".webp",
-                ):
-                    continue
-                cap = os.path.splitext(img)[0] + ".txt"
-                items.append(MediaSample("image", img, _read_caption(cap), reso, 1))
-
-        def scan_vid(reso: int):
-            vd = root / "video" / f"{reso}p"
-            for T in frames_list:
-                td = vd / f"{T}frames"
-                for mp4 in glob.glob(str(td / "*.mp4")):
-                    cap = os.path.splitext(mp4)[0] + ".txt"
-                    items.append(MediaSample("video", mp4, _read_caption(cap), reso, T))
-
-        if use_480p:
-            scan_img(480)
-            scan_vid(480)
-        if use_720p:
-            scan_img(720)
-            scan_vid(720)
-
-        if shuffle:
-            random.shuffle(items)
-        if max_samples is not None:
-            items = items[:max_samples]
-
-        self.items = items
-
-    def __len__(self):
-        return len(self.items)
-
-    def __getitem__(self, idx: int):
-        s = self.items[idx]
-        side = s.reso
-        if s.kind == "image":
-            frames = _load_image(s.path, side)  # [1,H,W,3]
-        else:
-            frames = _load_video(s.path, side, s.frames)  # [T,H,W,3]
-        return {
-            "kind": s.kind,
-            "path": s.path,
-            "caption": s.caption,
-            "video": frames,  # [T,H,W,3], in [-1,1]
-            "T": frames.shape[0],
-            "H": frames.shape[1],
-            "W": frames.shape[2],
-        }
 
 
 # ---- Text (Bridge) helpers
@@ -543,41 +361,30 @@ def main(args):
     bridge = BridgeEncoderModel(text_len=args.text_len, device=device, dtype=dtype)
 
     # Data
-    frames_list = [int(x) for x in args.frames.split(",") if x.strip()]
-    ds = MediaDataset(
-        args.data_root,
-        args.use_480p,
-        args.use_720p,
-        frames_list=frames_list,
-        max_samples=args.max_samples,
-        shuffle=args.shuffle,
+    frames = [int(x) for x in args.frames.split(",") if x.strip()]
+    reses = [int(x) for x in args.resolutions.split(",") if x.strip()]
+    dataset = MixedCaptioned(
+        root=args.data_root,
+        frames_options=frames,
+        resolutions=reses,
+        center_crop=True,
+        seed=args.seed,
     )
-    if len(ds) == 0:
+    if len(dataset) == 0:
         raise RuntimeError("No samples found under the given config.")
-    print(f"[data] total samples: {len(ds)}")
+    print(f"[data] total samples: {len(dataset)}")
 
-    def _collate(batch):
-        # batch is list of dicts
-        caps = [b["caption"] for b in batch]
-        # pad to max T in batch; stack videos
-        T_max = max(b["video"].shape[0] for b in batch)
-        vids = []
-        for b in batch:
-            v = b["video"]
-            if v.shape[0] != T_max:
-                v = _ensure_nframes(v, T_max)
-            vids.append(v)
-        vids = torch.stack(vids, dim=0)  # [B,T,H,W,3]
-        return {"captions": caps, "video": vids}
+    def guess_bs(res, T, base=16):
+        scale = (1.0 + T / 4.0) * (res / 16.0) ** 2
+        ref = (1.0 + 1 / 4.0) * (480 / 16.0) ** 2
+        return max(1, int(base * ref / scale))
 
+    batch_sizes = {
+        (r, f): guess_bs(r, f, base=args.base_batch) for r in reses for f in frames
+    }
+    sampler = BucketBatchSampler(dataset, batch_sizes, seed=args.seed)
     loader = DataLoader(
-        ds,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        pin_memory=True,
-        collate_fn=_collate,
-        drop_last=True,
+        dataset, batch_sampler=sampler, num_workers=args.workers, pin_memory=True
     )
 
     # Optimizer
@@ -598,8 +405,8 @@ def main(args):
         for batch in loader:
             if step >= args.steps:
                 break
-            vids = batch["video"].to(device)  # [B,T,H,W,3], in [-1,1]
-            caps: List[str] = batch["captions"]
+            vids = batch["pixel"].permute(0, 1, 3, 4, 2).to(device)  # [B,T,H,W,3]
+            caps: List[str] = batch["caption"]
 
             # text → tokens → context
             tokens_list = bridge(caps, device)  # list of [L_i, d]
