@@ -36,6 +36,7 @@ from kv_lora_inject import (
     LoRALinear,
 )
 from mixed_media import MixedCaptioned, BucketBatchSampler
+from wan_vae_loader import load_wan_vae
 
 # --- Configuration / args
 import argparse
@@ -61,6 +62,18 @@ def build_argparser():
         type=str,
         default=None,
         help="Single .safetensors (optional if --transformer_weights_dir set).",
+    )
+    p.add_argument(
+        "--vae_dir",
+        type=str,
+        default=os.environ.get("WAN_VAE_DIR", None),
+        help="Folder containing Wan VAE weights.",
+    )
+    p.add_argument(
+        "--vae_ckpt",
+        type=str,
+        default=os.environ.get("WAN_VAE_CKPT", None),
+        help="Path to Wan VAE .safetensors checkpoint.",
     )
     p.add_argument("--text_len", type=int, default=512)
 
@@ -247,32 +260,32 @@ def call_dit(
     return model(x_t, t, context)
 
 
-def encode_video_to_latents(model, video_bthwc: torch.Tensor) -> torch.Tensor:
-    """
-    video_bthwc: [B, T, H, W, 3] in [-1,1]
-    Returns latents with same B,T,H',W',C' as Wan expects.
-    """
-    # Try common Wan VAEs: model.vae.encode_video or model.vae.encode
-    vae = getattr(model, "vae", None)
-    if vae is None:
-        raise RuntimeError("WanModel has no .vae; please adapt encode path.")
+@torch.no_grad()
+def _norm_to_neg1_pos1(x: torch.Tensor) -> torch.Tensor:
+    # x uint8 [0,255] or float [0,1] -> float [-1,1]
+    if x.dtype in (torch.uint8, torch.int16, torch.int32, torch.int64):
+        x = x.float() / 255.0
+    return x.mul_(2.0).sub_(1.0)
 
-    # Prefer a vectorized encode if available
-    if hasattr(vae, "encode_video"):
-        return vae.encode_video(video_bthwc)  # type: ignore
 
-    if hasattr(vae, "encode"):
-        B, T, H, W, C = video_bthwc.shape
-        outs = []
-        for b in range(B):
-            per = []
-            for t in range(T):
-                img = video_bthwc[b, t].permute(2, 0, 1).unsqueeze(0)  # [1,3,H,W]
-                lat = vae.encode(img)  # [1,C',H',W'] (assumed)
-                per.append(lat)
-            outs.append(torch.stack(per, dim=1))  # [1,T,C',H',W']
-        return torch.cat(outs, dim=0)  # [B,T,C',H',W']
-    raise RuntimeError("Don't know how to encode latents; add your repo's method here.")
+@torch.no_grad()
+def encode_image_to_latents(vae, imgs: torch.Tensor) -> torch.Tensor:
+    # imgs: [B,3,H,W] in 0..1 or 0..255 -> [-1,1] -> [B,1,16,H/8,W/8]
+    imgs = _norm_to_neg1_pos1(imgs)
+    z = vae.encode(imgs)
+    return z
+
+
+@torch.no_grad()
+def encode_video_to_latents(vae, vids: torch.Tensor) -> torch.Tensor:
+    # vids: [B,T,3,H,W] -> [-1,1] -> [B,1+T/4,16,H/8,W/8]
+    vids = _norm_to_neg1_pos1(vids)
+    z = vae.encode(vids)
+    return z
+
+
+def parse_allowed_frames(arg: str) -> List[int]:
+    return [int(x) for x in arg.split(",") if x.strip()]
 
 
 def make_velocity_training_pair(
@@ -325,6 +338,9 @@ def main(args):
     _apply_filtered_state(model, state)
     model.requires_grad_(False)
 
+    # build/load VAE explicitly (Wan keeps it separate from the DiT)
+    vae = load_wan_vae(args.vae_ckpt or args.vae_dir, device=device, dtype=dtype)
+
     # Inject LoRA into cross-attn targets (default q/k/v/o)
     targets = tuple([s.strip() for s in args.targets.split(",") if s.strip()])
     inject_lora_kv(
@@ -364,7 +380,7 @@ def main(args):
     bridge = BridgeEncoderModel(text_len=args.text_len, device=device, dtype=dtype)
 
     # Data
-    frames = [int(x) for x in args.frames.split(",") if x.strip()]
+    frames = parse_allowed_frames(args.frames)
     reses = [int(x) for x in args.resolutions.split(",") if x.strip()]
     dataset = MixedCaptioned(
         root=args.data_root,
@@ -408,7 +424,7 @@ def main(args):
         for batch in loader:
             if step >= args.steps:
                 break
-            vids = batch["pixel"].permute(0, 1, 3, 4, 2).to(device)  # [B,T,H,W,3]
+            vids = batch["pixel"].to(device)  # [B,T,3,H,W]
             caps: List[str] = batch["caption"]
 
             # text → tokens → context
@@ -420,7 +436,7 @@ def main(args):
 
             # encode latents
             vids = vids.to(dtype=torch.float32)  # VAE usually wants fp32
-            x1 = encode_video_to_latents(model, vids)  # shape [B,T,C',H',W']
+            x1 = encode_video_to_latents(vae, vids)  # shape [B,1+T/4,16,H',W']
             x1 = x1.to(device=device, dtype=dtype)
 
             # flow-matching pair
