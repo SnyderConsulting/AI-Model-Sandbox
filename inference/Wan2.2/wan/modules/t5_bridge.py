@@ -239,6 +239,16 @@ class BridgeEncoderModel:
 
         ckpt = torch.load(self.ckpt_path, map_location="cpu")
         sd = ckpt.get("bridge", ckpt)
+        w = sd.get("in_proj.weight", None)
+        if w is not None:
+            d_llm_ckpt = w.shape[1]
+            d_llm_live = getattr(self.llm.config, "hidden_size", None)
+            if d_llm_live != d_llm_ckpt:
+                raise RuntimeError(
+                    f"Bridge/LLM mismatch: ckpt expects d_llm={d_llm_ckpt} but loaded LLM has d_llm={d_llm_live}. "
+                    "Fix by (A) installing transformers/qwen-vl-utils so Qwen2_5_VL loads, or "
+                    "(B) retraining the bridge for the current LLM dimension."
+                )
         missing, unexpected = self.bridge.load_state_dict(sd, strict=False)
         if missing or unexpected:
             print(
