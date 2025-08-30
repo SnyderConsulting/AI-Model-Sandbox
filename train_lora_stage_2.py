@@ -236,34 +236,50 @@ def _apply_filtered_state(model: nn.Module, state: Dict[str, torch.Tensor]) -> N
         print("unexpected:", unexpected)
 
 
-# graceful attempt to call DiT forward under various repos
-def call_dit(
-    model: nn.Module,
-    x_t: torch.Tensor,
-    t: torch.Tensor,
-    context: torch.Tensor,
-    mask: Optional[torch.Tensor],
-) -> torch.Tensor:
-    # Common signatures:
-    # y/context mask names vary a lot; try a few.
+def call_dit(model, x_t, t, context, mask):
+    """
+    Normalizes shapes and calls Wan DiT with the required seq_len argument.
+    Accepts x_t as [B,S,C,H,W] (video) or [B,C,H,W] (image).
+    """
+    device = x_t.device
+
+    if x_t.dim() == 5:
+        B, S, C, H, W = x_t.shape
+        x_in = x_t.reshape(B * S, C, H, W)   # flatten sequences into batch
+        seq_len = S
+        bs = B * S
+    elif x_t.dim() == 4:
+        B, C, H, W = x_t.shape
+        x_in = x_t
+        seq_len = 1
+        bs = B
+    else:
+        raise AssertionError(f"Unexpected latent shape {tuple(x_t.shape)}")
+
+    # Normalize timestep tensor to match flattened batch
+    if t.ndim == 0:
+        t = t.view(1).repeat(bs)
+    elif t.shape[0] == B and seq_len > 1:
+        t = t.repeat_interleave(seq_len)
+    elif t.shape[0] != bs:
+        t = t.reshape(-1)[:1].repeat(bs)
+    t = t.to(device)
+
+    # Optional mask -> [B, S] on correct device (if provided)
+    m = None
+    if mask is not None:
+        m = mask.to(device)
+        if x_t.dim() == 5:
+            if m.dim() == 1:
+                m = m.view(B, seq_len)
+            elif m.dim() == 2 and m.shape[1] != seq_len:
+                m = m[:, :seq_len]
+
+    # Some Wan builds require seq_len and may/may not accept mask kwarg.
     try:
-        return model(x_t, t, context, mask=mask)
-    except Exception:
-        pass
-    try:
-        return model(x_t, t, context=context, mask=mask)
-    except Exception:
-        pass
-    try:
-        return model(x_t, t, y=context, y_mask=mask)
-    except Exception:
-        pass
-    try:
-        return model.diffusion_model(x_t, t, context, mask)  # Wan style
-    except Exception:
-        pass
-    # As a last resort:
-    return model(x_t, t, context)
+        return model(x_in, t, context, seq_len=seq_len, mask=m)
+    except TypeError:
+        return model(x_in, t, context, seq_len=seq_len)
 
 
 @torch.no_grad()
