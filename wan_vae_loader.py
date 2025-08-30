@@ -1,116 +1,114 @@
 from __future__ import annotations
 import importlib
+import os  # noqa: F401
+import sys
 from pathlib import Path
 from typing import Optional
 import torch
 
-# We try a few common module paths used by Wan 2.x repos.
-CANDIDATES = [
-    ("inference.Wan2.2.wan.modules.vae.video_vae", "WanVAE", "from_pretrained"),
-    ("inference.Wan2.2.wan.modules.vae", "WanVAE", "from_pretrained"),
-    ("inference.Wan2.2.wan.modules.vae", "load_vae", None),
-    ("wan.modules.vae.video_vae", "WanVAE", "from_pretrained"),
-    ("wan.modules.vae", "WanVAE", "from_pretrained"),
-    ("wan.modules.vae", "load_vae", None),
-]
+CANDIDATE_MODULES = (
+    "wan.modules.vae",  # many releases
+    "wan.modules.vae3d",  # some releases
+    "wan.modules.stvae",  # some releases
+    "wan.modules.video_vae",  # some forks
+)
 
 
-def _maybe_find_vae_file(root: str | Path) -> Optional[str]:
-    root = Path(root)
-    if not root.exists():
+def _ensure_on_path(vae_dir: Optional[str]):
+    if vae_dir:
+        p = Path(vae_dir)
+        if (p / "wan").exists():
+            sys.path.insert(0, str(p))
+        elif (p / "inference" / "Wan2.2" / "wan").exists():
+            sys.path.insert(0, str(p / "inference" / "Wan2.2"))
+        else:
+            # still add; user may have already put correct root
+            sys.path.insert(0, str(p))
+
+
+def _import_vae_module(name: str):
+    try:
+        return importlib.import_module(name)
+    except Exception:
         return None
-    # look for common filenames
-    for name in ["vae.safetensors", "video_vae.safetensors", "wan_vae.safetensors"]:
-        p = root / name
-        if p.exists():
-            return str(p)
-    # last resort: the only .safetensors under root
-    ss = list(root.rglob("*.safetensors"))
-    return str(ss[0]) if ss else None
+
+
+def _first_existing_module(preferred: Optional[str]) -> str:
+    if preferred:
+        mod = _import_vae_module(preferred)
+        if mod is not None:
+            return preferred
+    for m in CANDIDATE_MODULES:
+        mod = _import_vae_module(m)
+        if mod is not None:
+            return m
+    raise RuntimeError(
+        "Could not import any Wan VAE module. "
+        f"Tried preferred={preferred!r} and candidates={CANDIDATE_MODULES}. "
+        "Check that your Wan repo (the folder that contains 'wan/modules') "
+        "is on PYTHONPATH, or pass --vae_dir to the correct folder."
+    )
 
 
 def load_wan_vae(
-    vae_dir_or_ckpt: Optional[str], device: torch.device, dtype: torch.dtype
+    vae_dir: Optional[str],
+    vae_module: Optional[str],
+    ckpt_path: str,
+    device: torch.device,
+    dtype: torch.dtype,
 ):
-    """
-    Returns an object with a callable 'encode' that accepts:
-      - image tensor  [B,3,H,W] in [-1,1]  -> [B, 1, 16, H/8, W/8]
-      - video tensor  [B,T,3,H,W] in [-1,1] -> [B, 1+T/4, 16, H/8, W/8]
-    """
-    # Determine resource
-    ckpt = None
-    if vae_dir_or_ckpt:
-        p = Path(vae_dir_or_ckpt)
-        if p.is_file():
-            ckpt = str(p)
-        else:
-            ckpt = _maybe_find_vae_file(p)
+    # 1) Make sure the Wan repo root (the directory that contains 'wan/') is on sys.path.
+    _ensure_on_path(vae_dir)
 
-    # Try to import from repo
-    last_err = None
-    for mod_name, attr, ctor in CANDIDATES:
-        try:
-            m = importlib.import_module(mod_name)
-            obj = getattr(m, attr)
-            if callable(obj) and ctor is None:
-                vae = obj(ckpt or vae_dir_or_ckpt) if ckpt or vae_dir_or_ckpt else obj()
-            elif hasattr(obj, ctor or ""):
-                vae = (
-                    getattr(obj, ctor)(ckpt or vae_dir_or_ckpt)
-                    if ckpt or vae_dir_or_ckpt
-                    else getattr(obj, ctor)()
-                )
-            else:
-                vae = obj  # already an instance
-            # move / cast if methods exist
-            if hasattr(vae, "to"):
-                vae.to(device=device, dtype=dtype)
-            if hasattr(vae, "eval"):
-                vae.eval()
+    # 2) Find an importable module name
+    module_name = _first_existing_module(vae_module)
+
+    # 3) Import and construct the VAE
+    mod = importlib.import_module(module_name)
+
+    # Common class/function names in different Wan drops:
+    ctor_names = ["VAE", "WanVAE", "VideoVAE", "STVAE", "build_vae", "load_vae"]
+    obj = None
+    for name in ctor_names:
+        if hasattr(mod, name):
+            obj = getattr(mod, name)
             break
-        except Exception as e:
-            last_err = e
-            vae = None
-            continue
-
-    if vae is None:
+    if obj is None:
         raise RuntimeError(
-            f"Could not import Wan VAE. Last error: {last_err}\n"
-            f"Set --vae_dir to the Wan VAE folder or --vae_ckpt to its .safetensors."
+            f"Loaded module '{module_name}' but couldn't find a VAE constructor "
+            f"(tried {ctor_names}). Please open {module_name} and pick the class/function."
         )
 
-    class _Wrapper(torch.nn.Module):
-        def __init__(self, inner):
-            super().__init__()
-            self.inner = inner
+    # 4) Instantiate and load weights (support .safetensors and .pth)
+    if callable(obj) and not isinstance(obj, type):
+        vae = obj()  # build_vae()/load_vae() returning nn.Module
+    else:
+        try:
+            vae = obj()
+        except TypeError as e:
+            # fallback: some ctors need no args but disallow missing; try defaults
+            try:
+                vae = obj  # maybe it's already a module instance
+            except Exception:
+                raise e
 
-        @torch.no_grad()
-        def encode(self, x: torch.Tensor) -> torch.Tensor:
-            # Accept [B,3,H,W] or [B,T,3,H,W], values in [-1,1]
-            if x.dim() == 4:  # image
-                # common interfaces: encode returns either Tensor or a struct with .latent
-                if hasattr(self.inner, "encode"):
-                    y = self.inner.encode(x)
-                elif hasattr(self.inner, "forward"):
-                    y = self.inner(x)
-                else:
-                    raise RuntimeError("Wan VAE has no callable encode/forward")
-                return getattr(y, "latent", y)
-            elif x.dim() == 5:  # video
-                if hasattr(self.inner, "encode_video"):
-                    y = self.inner.encode_video(x)
-                    return getattr(y, "latent", y)
-                # fallback: run chunked along time using .encode
-                B, T, _, H, W = x.shape
-                outs = []
-                for t0 in range(0, T, 4):
-                    xt = x[:, t0 : t0 + 4]  # [B,<=4,3,H,W]
-                    xt = xt.reshape(-1, 3, H, W)  # merge time
-                    yt = self.encode(xt)  # [B*<=4, 1, 16, H/8, W/8]
-                    # reassemble with 3D causal compression (1 frame spatial-only, rest temporal 4x)
-                    outs.append(yt)
-                return torch.cat(outs, dim=1)
-            else:
-                raise ValueError(f"Unexpected input rank {x.dim()} for VAE.encode()")
+    # 5) Load checkpoint
+    ckpt_path = str(ckpt_path)
+    if ckpt_path.endswith(".safetensors"):
+        from safetensors.torch import load_file as st_load
 
-    return _Wrapper(vae)
+        sd = st_load(ckpt_path)
+        missing, unexpected = vae.load_state_dict(sd, strict=False)
+    else:
+        sd = torch.load(ckpt_path, map_location="cpu")
+        # some Wan checkpoints wrap {"state_dict":..., "module":...}
+        state = sd.get("state_dict", sd.get("module", sd))
+        missing, unexpected = vae.load_state_dict(state, strict=False)
+
+    if len(unexpected) > 0:
+        print(f"[wan_vae_loader] unexpected keys: {unexpected[:8]} ...")
+    if len(missing) > 0:
+        print(f"[wan_vae_loader] missing keys   : {missing[:8]} ...")
+
+    vae.to(device=device, dtype=dtype).eval()
+    return vae
