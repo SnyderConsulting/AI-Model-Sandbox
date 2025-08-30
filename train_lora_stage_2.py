@@ -309,8 +309,10 @@ def main(args):
     # Env toggles so Wan code uses the Bridge implementation
     os.environ["WAN_USE_BRIDGE"] = "1"
     os.environ["WAN_BRIDGE_CKPT"] = args.bridge_ckpt
-    os.environ["WAN_LLM_DIR"] = args.llm_dir
-    os.environ["WAN_BRIDGE_GLOBAL_SCALE"] = str(args.global_scale)
+    os.environ["WAN_BRIDGE_LLM_DIR"] = args.llm_dir
+    os.environ["WAN_BRIDGE_DTYPE"] = "bf16" if getattr(args, "bf16", False) else "fp16"
+    os.environ["WAN_BRIDGE_GLOBAL_SCALE"] = str(getattr(args, "global_scale", 1.0))
+    os.environ["WAN_BRIDGE_FORCE_VL"] = "1"
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.bfloat16 if (args.bf16 and device.type == "cuda") else torch.float32

@@ -7,7 +7,7 @@ from typing import List, Optional, Union
 
 import torch
 import torch.nn as nn
-from transformers import AutoProcessor
+from transformers import AutoProcessor, AutoModelForCausalLM, AutoTokenizer
 
 try:
     from transformers import Qwen2_5_VLForConditionalGeneration
@@ -200,64 +200,65 @@ class BridgeEncoderModel:
 
         # --- load LLM (tokenizer/processor + model) ---
         self.is_vl = False
-        device_map = "auto" if self.device.type == "cuda" else {"": "cpu"}
-        force_vl = os.environ.get("WAN_BRIDGE_FORCE_VL", "1").lower() not in (
-            "0",
-            "false",
-            "no",
+        device_map = "auto" if self.device.type == "cuda" else None
+        force_vl = os.environ.get("WAN_BRIDGE_FORCE_VL", "0").lower() in (
+            "1",
+            "true",
+            "yes",
         )
 
-        if Qwen2_5_VLForConditionalGeneration is not None:
-            try:
-                self.proc = AutoProcessor.from_pretrained(
-                    self.llm_dir, trust_remote_code=True
+        loaded_cls = None
+        try:
+            if Qwen2_5_VLForConditionalGeneration is None:
+                raise RuntimeError(
+                    "Qwen2_5_VLForConditionalGeneration not in transformers"
                 )
-                self.llm = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-                    self.llm_dir,
-                    torch_dtype=self.dtype,
-                    device_map=device_map,
-                    low_cpu_mem_usage=True,
-                    trust_remote_code=True,
+            # Processor + VL model
+            self.proc = AutoProcessor.from_pretrained(
+                self.llm_dir, trust_remote_code=True
+            )
+            self.llm = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                self.llm_dir,
+                dtype=self.dtype,
+                device_map=device_map,
+                trust_remote_code=True,
+            )
+            loaded_cls = "Qwen2_5_VLForConditionalGeneration"
+            self.is_vl = True
+        except Exception as e:
+            if force_vl:
+                raise RuntimeError(
+                    f"[Bridge] Forced VL load failed for '{self.llm_dir}'. "
+                    f"Install qwen-vl-utils and use a Qwen2.5-VL repo. Original error: {e}"
                 )
-                self.is_vl = True
-            except Exception as e:
-                if force_vl:
-                    print(
-                        "[BridgeEncoderModel] Qwen2.5-VL load failed; refusing to fall back because "
-                        "WAN_BRIDGE_FORCE_VL is set. Full error:"
-                    )
-                    raise
-                else:
-                    print(
-                        f"[BridgeEncoderModel] Qwen2.5-VL load failed ({e}). Falling back to AutoModelForCausalLM."
-                    )
-
-        if not self.is_vl:
-            from transformers import AutoTokenizer, AutoModelForCausalLM
-
+            # Fallback: text-only LLM path (will NOT understand images/videos)
             self.tok = AutoTokenizer.from_pretrained(
                 self.llm_dir, use_fast=True, trust_remote_code=True
             )
             self.llm = AutoModelForCausalLM.from_pretrained(
                 self.llm_dir,
-                torch_dtype=self.dtype,
+                dtype=self.dtype,
                 device_map=device_map,
-                low_cpu_mem_usage=True,
                 trust_remote_code=True,
             )
-
+            loaded_cls = "AutoModelForCausalLM"
         self.llm.eval().requires_grad_(False)
 
+        # Report what we actually loaded
         d_llm = getattr(self.llm.config, "hidden_size", None)
+        mtype = getattr(self.llm.config, "model_type", "<unknown>")
         if d_llm is None:
             raise RuntimeError(
                 "Loaded LLM has no config.hidden_size; cannot build bridge."
             )
+        print(
+            f"[Bridge] LLM: {loaded_cls}  model_type={mtype}  hidden_size={d_llm}  dir={self.llm_dir}"
+        )
 
         # --- build + load bridge ---
         self.bridge = (
             PerceiverBridge(
-                d_llm=d_llm,
+                d_llm=d_llm,  # ALWAYS use the actual hidden size
                 d_wan=self.d_wan,
                 L_wan=self.L_wan,
                 d_mid=1024,
@@ -268,23 +269,21 @@ class BridgeEncoderModel:
             .eval()
         )
 
+        # Load bridge and validate dimensionality against ckpt if possible
         ckpt = torch.load(self.ckpt_path, map_location="cpu")
         sd = ckpt.get("bridge", ckpt)
-
-        # If the bridge was saved as raw module weights, pick a canonical key:
-        in_keys = [k for k in sd.keys() if k.endswith("in_proj.weight")]
-        if in_keys:
-            ckpt_d_llm = sd[in_keys[0]].shape[1]
-            if ckpt_d_llm != d_llm:
-                raise RuntimeError(
-                    f"Bridge/LLM hidden_size mismatch: bridge expects d_llm={ckpt_d_llm}, "
-                    f"but loaded LLM has d_llm={d_llm}. "
-                    "This is almost always due to falling back to a CausalLM or pointing to the wrong LLM repo."
-                )
+        # If ckpt has in_proj.weight, its 2nd dim is the expected d_llm
+        w = sd.get("in_proj.weight", None)
+        if w is not None and w.shape[1] != d_llm:
+            raise RuntimeError(
+                f"Bridge/LLM hidden_size mismatch: bridge expects d_llm={w.shape[1]}, "
+                f"but loaded LLM has d_llm={d_llm}. "
+                f"Set WAN_BRIDGE_LLM_DIR to your Qwen2.5-VL repo (or retrain the bridge)."
+            )
         missing, unexpected = self.bridge.load_state_dict(sd, strict=False)
         if missing or unexpected:
             print(
-                f"[BridgeEncoderModel] Warning while loading state_dict: missing={missing}, unexpected={unexpected}"
+                f"[Bridge] Warning while loading state_dict: missing={missing}, unexpected={unexpected}"
             )
 
         # --- perf knobs ---

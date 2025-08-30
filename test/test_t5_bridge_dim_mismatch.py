@@ -52,4 +52,4 @@ def test_bridge_dim_mismatch(tmp_path, monkeypatch):
 
     with pytest.raises(RuntimeError) as excinfo:
         BridgeEncoderModel(text_len=16, device="cpu")
-    assert "Bridge/LLM mismatch" in str(excinfo.value)
+    assert "Bridge/LLM hidden_size mismatch" in str(excinfo.value)
