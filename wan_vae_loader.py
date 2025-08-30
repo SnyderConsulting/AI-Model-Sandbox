@@ -1,114 +1,78 @@
+# wan_vae_loader.py  — supports models.wan.vae2_2.Wan2_2_VAE and unifies encode API
 from __future__ import annotations
-import importlib
-import os  # noqa: F401
-import sys
+import importlib, os, sys
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List
 import torch
-
-CANDIDATE_MODULES = (
-    "wan.modules.vae",  # many releases
-    "wan.modules.vae3d",  # some releases
-    "wan.modules.stvae",  # some releases
-    "wan.modules.video_vae",  # some forks
-)
-
+import torch.nn as nn
 
 def _ensure_on_path(vae_dir: Optional[str]):
+    # Put a folder that contains "models/" or "wan/" on sys.path
     if vae_dir:
         p = Path(vae_dir)
-        if (p / "wan").exists():
-            sys.path.insert(0, str(p))
-        elif (p / "inference" / "Wan2.2" / "wan").exists():
-            sys.path.insert(0, str(p / "inference" / "Wan2.2"))
-        else:
-            # still add; user may have already put correct root
+        if p.exists():
             sys.path.insert(0, str(p))
 
+def load_wan_vae(vae_dir: Optional[str],
+                 vae_module: Optional[str],
+                 ckpt_path: str,
+                 device: torch.device,
+                 dtype: torch.dtype):
+    """
+    Returns an object with a unified:
+        encode(x) -> latents
+    where:
+        x is [B,T,H,W,3] in [-1,1] or [B,3,H,W] in [-1,1]
+        latents is [B, 1+T/4, C', H', W'] (Wan-VAE style)
+    """
+    _ensure_on_path(vae_dir or os.getcwd())
 
-def _import_vae_module(name: str):
+    if not vae_module:
+        raise RuntimeError("Pass --vae_module, e.g. models.wan.vae2_2")
+
     try:
-        return importlib.import_module(name)
-    except Exception:
-        return None
+        mod = importlib.import_module(vae_module)
+    except Exception as e:
+        raise RuntimeError(f"Could not import {vae_module}: {e}")
 
-
-def _first_existing_module(preferred: Optional[str]) -> str:
-    if preferred:
-        mod = _import_vae_module(preferred)
-        if mod is not None:
-            return preferred
-    for m in CANDIDATE_MODULES:
-        mod = _import_vae_module(m)
-        if mod is not None:
-            return m
-    raise RuntimeError(
-        "Could not import any Wan VAE module. "
-        f"Tried preferred={preferred!r} and candidates={CANDIDATE_MODULES}. "
-        "Check that your Wan repo (the folder that contains 'wan/modules') "
-        "is on PYTHONPATH, or pass --vae_dir to the correct folder."
-    )
-
-
-def load_wan_vae(
-    vae_dir: Optional[str],
-    vae_module: Optional[str],
-    ckpt_path: str,
-    device: torch.device,
-    dtype: torch.dtype,
-):
-    # 1) Make sure the Wan repo root (the directory that contains 'wan/') is on sys.path.
-    _ensure_on_path(vae_dir)
-
-    # 2) Find an importable module name
-    module_name = _first_existing_module(vae_module)
-
-    # 3) Import and construct the VAE
-    mod = importlib.import_module(module_name)
-
-    # Common class/function names in different Wan drops:
-    ctor_names = ["VAE", "WanVAE", "VideoVAE", "STVAE", "build_vae", "load_vae"]
-    obj = None
-    for name in ctor_names:
-        if hasattr(mod, name):
-            obj = getattr(mod, name)
-            break
-    if obj is None:
-        raise RuntimeError(
-            f"Loaded module '{module_name}' but couldn't find a VAE constructor "
-            f"(tried {ctor_names}). Please open {module_name} and pick the class/function."
+    # ---- special-case your VAE class ----
+    if hasattr(mod, "Wan2_2_VAE"):
+        # instantiate your wrapper; it expects 'vae_pth', 'dtype', 'device'
+        inner = mod.Wan2_2_VAE(
+            vae_pth=ckpt_path,
+            dtype=(torch.bfloat16 if dtype == torch.bfloat16 else torch.float32),
+            device=("cuda" if device.type == "cuda" else "cpu"),
         )
 
-    # 4) Instantiate and load weights (support .safetensors and .pth)
-    if callable(obj) and not isinstance(obj, type):
-        vae = obj()  # build_vae()/load_vae() returning nn.Module
-    else:
-        try:
-            vae = obj()
-        except TypeError as e:
-            # fallback: some ctors need no args but disallow missing; try defaults
-            try:
-                vae = obj  # maybe it's already a module instance
-            except Exception:
-                raise e
+        class _Wrapper(nn.Module):
+            def __init__(self, inner):
+                super().__init__()
+                self.inner = inner
 
-    # 5) Load checkpoint
-    ckpt_path = str(ckpt_path)
-    if ckpt_path.endswith(".safetensors"):
-        from safetensors.torch import load_file as st_load
+            @torch.no_grad()
+            def encode(self, x: torch.Tensor) -> torch.Tensor:
+                """
+                x: [B,T,H,W,3] or [B,3,H,W]  in [-1,1]
+                returns [B, F, C, H', W'] with F = 1 + T/4
+                """
+                if x.dim() == 4:  # images → [B,3,H,W] -> [B,1,H,W,3]
+                    x = x.permute(0, 2, 3, 1)  # [B,H,W,3]
+                    x = x.unsqueeze(1)
 
-        sd = st_load(ckpt_path)
-        missing, unexpected = vae.load_state_dict(sd, strict=False)
-    else:
-        sd = torch.load(ckpt_path, map_location="cpu")
-        # some Wan checkpoints wrap {"state_dict":..., "module":...}
-        state = sd.get("state_dict", sd.get("module", sd))
-        missing, unexpected = vae.load_state_dict(state, strict=False)
+                assert x.dim() == 5 and x.size(-1) == 3, f"Expected [B,T,H,W,3], got {tuple(x.shape)}"
+                B, T, H, W, _ = x.shape
+                # per-sample list of [3,T,H,W]
+                lst: List[torch.Tensor] = [x[b].permute(3,0,1,2).contiguous() for b in range(B)]
+                # your class returns a list of [C', F', H', W'] tensors
+                z_list = self.inner.encode(lst)
+                # stack to [B, F', C', H', W']
+                z = torch.stack([z.permute(1,0,2,3).contiguous() for z in z_list], dim=0)
+                return z
 
-    if len(unexpected) > 0:
-        print(f"[wan_vae_loader] unexpected keys: {unexpected[:8]} ...")
-    if len(missing) > 0:
-        print(f"[wan_vae_loader] missing keys   : {missing[:8]} ...")
+        vae = _Wrapper(inner).to(device=device)
+        return vae
 
-    vae.to(device=device, dtype=dtype).eval()
-    return vae
+    raise RuntimeError(
+        f"Module '{vae_module}' imported, but no supported class was found. "
+        f"Expected 'Wan2_2_VAE' in that module."
+    )

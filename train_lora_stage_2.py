@@ -275,19 +275,12 @@ def _norm_to_neg1_pos1(x: torch.Tensor) -> torch.Tensor:
 
 
 @torch.no_grad()
-def encode_image_to_latents(vae, imgs: torch.Tensor) -> torch.Tensor:
-    # imgs: [B,3,H,W] in 0..1 or 0..255 -> [-1,1] -> [B,1,16,H/8,W/8]
-    imgs = _norm_to_neg1_pos1(imgs)
-    z = vae.encode(imgs)
-    return z
-
-
-@torch.no_grad()
-def encode_video_to_latents(vae, vids: torch.Tensor) -> torch.Tensor:
-    # vids: [B,T,3,H,W] -> [-1,1] -> [B,1+T/4,16,H/8,W/8]
-    vids = _norm_to_neg1_pos1(vids)
-    z = vae.encode(vids)
-    return z
+def encode_pixels_to_latents(vae, pixels_bthwc_or_bchw: torch.Tensor) -> torch.Tensor:
+    """
+    pixels: [B,T,H,W,3] or [B,3,H,W] in [-1,1]
+    returns: [B, F, C, H', W']
+    """
+    return vae.encode(pixels_bthwc_or_bchw)
 
 
 def parse_allowed_frames(arg: str) -> List[int]:
@@ -444,7 +437,7 @@ def main(args):
 
             # encode latents
             vids = vids.to(dtype=torch.float32)  # VAE usually wants fp32
-            x1 = encode_video_to_latents(vae, vids)  # shape [B,1+T/4,16,H',W']
+            x1 = encode_pixels_to_latents(vae, vids)  # shape [B,1+T/4,16,H',W']
             x1 = x1.to(device=device, dtype=dtype)
 
             # flow-matching pair
