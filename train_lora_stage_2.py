@@ -262,88 +262,98 @@ def _apply_filtered_state(model: nn.Module, state: Dict[str, torch.Tensor]) -> N
 
 def call_dit(model, x_t, t, context, mask=None):
     """
-    Prepares inputs for WanModel.forward, infers the correct seq_len from the model (defaults to 512),
-    runs the model, and returns a Tensor matching x_t's original layout.
+    Prepares inputs for WanModel.forward.
+    - Normalizes x_t to [B,C,T,H,W] using model.patch_embedding.in_channels
+    - Computes seq_len EXACTLY from patch_embedding (Conv3d) output shape
+    - Calls model and returns a Tensor with the same layout as the original x_t
     """
-    # --- infer in_channels from patch embedding ---
     pe = getattr(model, "patch_embedding", None)
+    assert pe is not None, "model.patch_embedding not found (Conv3d expected)"
     c_in = int(getattr(pe, "in_channels", 48))
 
-    # --- normalize x to [B, C, T, H, W] while remembering original layout ---
+    # ---- normalize x_t to [B,C,T,H,W] and remember original layout ----
     if x_t.dim() == 5:
-        if x_t.size(1) == c_in:                           # [B,C,T,H,W]
+        if x_t.size(1) == c_in:                 # [B,C,T,H,W]
             B, C, T, H, W = x_t.shape
             x_bcthw, orig = x_t, "BCTHW"
-        elif x_t.size(2) == c_in:                         # [B,T,C,H,W] -> [B,C,T,H,W]
+        elif x_t.size(2) == c_in:               # [B,T,C,H,W] -> [B,C,T,H,W]
             B, T, C, H, W = x_t.shape
             x_bcthw, orig = x_t.permute(0, 2, 1, 3, 4).contiguous(), "BTCHW"
         else:
-            # fallback: treat dim with value 1 as time if present
-            if x_t.size(1) == 1 and x_t.size(2) != 1:     # [B,1,T?,H,W] -> assume [B,T,C,H,W]
-                B, T, C, H, W = x_t.shape
-                x_bcthw, orig = x_t.permute(0, 2, 1, 3, 4).contiguous(), "BTCHW"
-            else:                                         # assume already [B,C,T,H,W]
+            # Heuristic fallback
+            if x_t.size(1) in (16, 32, 48):
                 B, C, T, H, W = x_t.shape
                 x_bcthw, orig = x_t, "BCTHW"
-    elif x_t.dim() == 4:
+            else:
+                B, T, C, H, W = x_t.shape
+                x_bcthw, orig = x_t.permute(0, 2, 1, 3, 4).contiguous(), "BTCHW"
+    elif x_t.dim() == 4:                        # [B,C,H,W] -> [B,C,1,H,W]
         B, C, H, W = x_t.shape
         T = 1
         x_bcthw, orig = x_t.unsqueeze(2).contiguous(), "BCHW"
     else:
         raise AssertionError(f"Unexpected x_t shape {tuple(x_t.shape)}")
 
-    # --- move/cast to model device/dtype ---
+    assert x_bcthw.size(1) == c_in, f"Expected channels={c_in}, got {x_bcthw.size(1)}"
+
+    # ---- compute seq_len from Conv3d output (exact) ----
+    def _as3(v, default):
+        if isinstance(v, int):
+            return (v, v, v)
+        if isinstance(v, (list, tuple)) and len(v) == 3:
+            return tuple(int(x) for x in v)
+        return default
+
+    kT, kH, kW = _as3(getattr(pe, "kernel_size", (1, 2, 2)), (1, 2, 2))
+    sT, sH, sW = _as3(getattr(pe, "stride", (1, 2, 2)), (1, 2, 2))
+    pT, pH, pW = _as3(getattr(pe, "padding", (0, 0, 0)), (0, 0, 0))
+    dT, dH, dW = _as3(getattr(pe, "dilation", (1, 1, 1)), (1, 1, 1))
+
+    def _conv_out(n, k, s, p, d):
+        return (n + 2*p - d*(k - 1) - 1) // s + 1
+
+    T_out = _conv_out(T, kT, sT, pT, dT)
+    H_out = _conv_out(H, kH, sH, pH, dH)
+    W_out = _conv_out(W, kW, sW, pW, dW)
+    seq_len = int(T_out * H_out * W_out)
+    assert seq_len > 0, f"Invalid seq_len computed: {seq_len} from (T,H,W)=({T},{H},{W})"
+
+    # ---- move/cast to model device/dtype ----
     device = next(model.parameters()).device
     mdtype = next(model.parameters()).dtype
     x_bcthw = x_bcthw.to(device=device, dtype=mdtype)
 
-    # --- infer the correct seq_len from the model (avoid gigantic values) ---
-    def _infer_seq_len(m, default=512):
-        for attr in ("L", "seq_len", "max_seq_len", "latent_len", "tokens"):
-            val = getattr(m, attr, None)
-            if isinstance(val, int) and val > 0:
-                return int(val)
-        for name in ("pos_embedding", "position_embedding", "pos_embed", "pos_emb"):
-            pe = getattr(m, name, None)
-            w = getattr(pe, "weight", None)
-            if torch.is_tensor(w):
-                return int(w.shape[-2] if w.dim() >= 2 else w.shape[-1])
-        return default
+    # ---- build inputs for forward ----
+    x_list = [x_bcthw[i] for i in range(B)]  # each [C,T,H,W]
 
-    seq_len = _infer_seq_len(model, 512)
-
-    # --- time steps tensor to shape [B] ---
     t = t.reshape(-1).to(device)
     if t.numel() == 1:
         t = t.repeat(B)
     elif t.numel() != B:
         t = t[:1].repeat(B)
 
-    # --- context -> List[Tensor [L, D_expected]] with padded/truncated last dim ---
+    # context -> List[Tensor [L, D_expected]] (pad/trunc last dim)
     te = getattr(model, "text_embedding", None)
     D_exp = None
     if te is not None:
         for m in te.modules():
             if isinstance(m, torch.nn.Linear):
-                D_exp = int(m.in_features)
-                break
+                D_exp = int(m.in_features); break
     if D_exp is None:
         D_exp = 4096
 
     def _pad_trunc_lastdim(c: torch.Tensor) -> torch.Tensor:
         d = c.size(-1)
-        if d == D_exp:
-            return c
-        if d < D_exp:
-            return F.pad(c, (0, D_exp - d))
+        if d == D_exp: return c
+        if d < D_exp:  return F.pad(c, (0, D_exp - d))
         return c[..., :D_exp]
 
     if isinstance(context, torch.Tensor):
-        if context.dim() == 3:                  # [B,L,D]
+        if context.dim() == 3:  # [B,L,D]
             context_list = [_pad_trunc_lastdim(context[i]) for i in range(min(B, context.size(0)))]
             if len(context_list) < B:
                 context_list += [context_list[0]] * (B - len(context_list))
-        elif context.dim() == 2:                # [L,D]
+        elif context.dim() == 2:  # [L,D]
             c = _pad_trunc_lastdim(context)
             context_list = [c for _ in range(B)]
         else:
@@ -361,11 +371,10 @@ def call_dit(model, x_t, t, context, mask=None):
 
     context_list = [c.to(device=device, dtype=mdtype) for c in context_list]
 
-    # --- forward ---
-    x_list = [x_bcthw[i] for i in range(B)]  # each [C,T,H,W]
+    # ---- forward ----
     out = model(x_list, t, context_list, seq_len=seq_len)
 
-    # --- stack outputs to tensor and restore original layout ---
+    # ---- stack outputs and restore original layout ----
     def _stack_to_bcthw(o):
         if torch.is_tensor(o):
             return o if o.dim() == 5 else o.unsqueeze(2)
@@ -377,13 +386,15 @@ def call_dit(model, x_t, t, context, mask=None):
         raise AssertionError(f"Unexpected model output type {type(o)}")
 
     y_bcthw = _stack_to_bcthw(out)  # [B,C,T,H,W]
+
     if orig == "BCTHW":
         y = y_bcthw
     elif orig == "BTCHW":
         y = y_bcthw.permute(0, 2, 1, 3, 4).contiguous()
     else:  # "BCHW"
         y = y_bcthw.squeeze(2).contiguous()
-    return y.to(dtype=mdtype)
+
+    return y.to(x_t.dtype)
 
 
 
