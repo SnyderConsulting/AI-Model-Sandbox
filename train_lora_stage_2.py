@@ -799,14 +799,6 @@ def main(args):
     # After you have constructed model/vae/optimizer and parsed args:
     AMP_DTYPE, scaler = setup_amp_and_models(args, model, vae)
 
-    # Keep only the small LoRA matrices in fp32 for stability
-    from kv_lora_inject import LoRALinear as _LoRALinear
-
-    for m in model.modules():
-        if isinstance(m, _LoRALinear) and m.lora_A is not None:
-            m.lora_A.data = m.lora_A.data.float()
-            m.lora_B.data = m.lora_B.data.float()
-
     step = 0
     running = 0.0
     pbar = tqdm(total=args.steps, desc="train-stage2")
