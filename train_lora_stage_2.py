@@ -236,81 +236,84 @@ def _apply_filtered_state(model: nn.Module, state: Dict[str, torch.Tensor]) -> N
         print("unexpected:", unexpected)
 
 
-# drop-in replacement for call_dit()
-
 def call_dit(model, x_t, t, context, mask=None):
     """
-    WanModel.forward expects:
-      - x:      List[Tensor] where each item is [C, F, H, W]
-      - t:      Tensor[B]
-      - context: List[Tensor[L_i, D]]
-      - seq_len: int = max token length after 3D patching
-    This helper converts common latent layouts and computes seq_len correctly.
+    Normalizes inputs for WanModel.forward and ensures context last-dim matches the
+    expected in_features of model.text_embedding (usually 4096).
     """
-    import torch
-
-    # -------- normalize x to a list of [C, F, H, W] --------
+    # ---------- x: to List[Tensor [C,F,H,W]] ----------
     if x_t.dim() == 5:
-        B = x_t.size(0)
-        # Determine expected channel count from the model
-        c_in = getattr(getattr(model, "patch_embedding", None), "in_channels", None)
-        if c_in is None:
-            c_in = getattr(model, "in_dim", None)
-        # Put channels in dim=1: [B, C, F, H, W]
-        if c_in is not None:
-            if x_t.size(1) == c_in:
-                x_bcthw = x_t
-            elif x_t.size(2) == c_in:
-                x_bcthw = x_t.permute(0, 2, 1, 3, 4).contiguous()  # [B,T,C,H,W] -> [B,C,T,H,W]
-            else:
-                # Fallback heuristic
-                x_bcthw = x_t if x_t.size(1) > x_t.size(2) else x_t.permute(0, 2, 1, 3, 4).contiguous()
+        # Accept [B,C,T,H,W] or [B,T,C,H,W] -> [B,C,T,H,W]
+        if x_t.size(1) in (1, 3, 16, 32, 48):
+            x_bcthw = x_t
         else:
-            # Fallback if model doesn't expose in_channels
-            x_bcthw = x_t if x_t.size(1) in (16, 32, 48) else x_t.permute(0, 2, 1, 3, 4).contiguous()
-
-        C, F, H, W = x_bcthw.shape[1:]
-        x_list = [x_bcthw[i] for i in range(B)]  # list of [C, F, H, W]
+            x_bcthw = x_t.permute(0, 2, 1, 3, 4).contiguous()
+        B, C, Fd, H, W = x_bcthw.shape
+        x_list = [x_bcthw[i] for i in range(B)]  # each [C,F,H,W]
     elif x_t.dim() == 4:
-        # [B, C, H, W] -> T=1
+        # [B,C,H,W] -> T=1
         B, C, H, W = x_t.shape
-        F = 1
+        Fd = 1
         x_list = [x_t[i].unsqueeze(1) for i in range(B)]
     else:
         raise AssertionError(f"Unexpected latent shape {tuple(x_t.shape)}")
 
-    # -------- compute seq_len to satisfy: seq_lens.max() <= seq_len --------
-    # Wan uses Conv3d with kernel_size == stride == patch_size
-    ps = getattr(model, "patch_size", None)
-    if ps is None:
-        ps = getattr(getattr(model, "patch_embedding", None), "kernel_size", (1, 2, 2))
-    pt, ph, pw = int(ps[0]), int(ps[1]), int(ps[2])
-    seq_len = (F // pt) * (H // ph) * (W // pw)
+    # ---------- seq_len from patch_embedding kernel/stride ----------
+    pe = getattr(model, "patch_embedding", None)
+    ks = getattr(pe, "kernel_size", (1, 2, 2))
+    if isinstance(ks, int):
+        ks = (1, ks, ks)
+    pt, ph, pw = int(ks[0]), int(ks[1]), int(ks[2])
+    seq_len = (Fd // pt) * (H // ph) * (W // pw)
 
-    # -------- normalize t to shape [B] --------
-    t = t.reshape(-1).to(x_t.device)
+    # ---------- t: ensure shape [B] ----------
+    device = next(model.parameters()).device
+    dtype = next(model.parameters()).dtype
+    t = t.reshape(-1).to(device)
     if t.numel() == 1:
-        t = t.repeat(len(x_list))
-    elif t.numel() != len(x_list):
-        t = t[:1].repeat(len(x_list))
+        t = t.repeat(B)
+    elif t.numel() != B:
+        t = t[:1].repeat(B)
 
-    # -------- normalize context to List[Tensor] --------
+    # ---------- context: make List[Tensor [L, D_expected]] ----------
+    # Probe expected input dim for text_embedding (first Linear.in_features); fallback 4096.
+    ctx_in = None
+    te = getattr(model, "text_embedding", None)
+    if te is not None:
+        for m in te.modules():
+            if isinstance(m, torch.nn.Linear):
+                ctx_in = int(m.in_features)
+                break
+    if ctx_in is None:
+        ctx_in = 4096
+
+    def _fix_ctx_dim(c: torch.Tensor) -> torch.Tensor:
+        # c: [..., D]
+        d = c.size(-1)
+        if d == ctx_in:
+            return c
+        if d < ctx_in:
+            return F.pad(c, (0, ctx_in - d))
+        return c[..., :ctx_in]
+
     if isinstance(context, torch.Tensor):
-        if context.dim() == 3:            # [B, L, D]
-            context_list = [c for c in context]
-        elif context.dim() == 2:          # [L, D]
-            context_list = [context] * len(x_list)
+        if context.dim() == 3:      # [B, L, D]
+            context_list = [_fix_ctx_dim(c) for c in context]
+        elif context.dim() == 2:    # [L, D]
+            c = _fix_ctx_dim(context)
+            context_list = [c for _ in range(B)]
         else:
             raise AssertionError(f"Unexpected context tensor shape {tuple(context.shape)}")
     elif isinstance(context, (list, tuple)):
-        context_list = list(context)
-        if len(context_list) != len(x_list):
-            # replicate first element if needed
-            context_list = [context_list[0]] * len(x_list)
+        context_list = [_fix_ctx_dim(torch.as_tensor(c)) for c in context]
+        if len(context_list) != B:
+            context_list = [context_list[0] for _ in range(B)]
     else:
         raise AssertionError("context must be a Tensor or a list/tuple of Tensors")
 
-    # WanModel.forward does not accept 'mask' kwarg in this build
+    context_list = [c.to(device=device, dtype=dtype) for c in context_list]
+
+    # ---------- forward (this build does not accept 'mask') ----------
     return model(x_list, t, context_list, seq_len=seq_len)
 
 
