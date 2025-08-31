@@ -70,6 +70,10 @@ def debug_step(step, vids=None, x1=None, x_t=None, v=None, pred=None, loss=None,
         try:
             tu = torch.unique(t.detach().to(torch.int64), sorted=True)
             print("t unique (first 8):", tu[:8].tolist(), " total:", int(tu.numel()))
+            print("[t] mean=", float(t.detach().float().mean()),
+                "std=", float(t.detach().float().std(unbiased=False)),
+                "min=", float(t.detach().float().min()),
+                "max=", float(t.detach().float().max()))
         except Exception:
             pass
     if (pred is not None) and (v is not None):
@@ -305,32 +309,33 @@ def _apply_filtered_state(model: nn.Module, state: Dict[str, torch.Tensor]) -> N
 
 def call_dit(model, x_t, t, context, mask=None):
     """
-    Prepares inputs for WanModel.forward.
-    - Normalizes x_t to [B,C,T,H,W] using model.patch_embedding.in_channels
-    - Computes seq_len EXACTLY from patch_embedding (Conv3d) output shape
-    - Calls model and returns a Tensor with the same layout as the original x_t
+    WanModel.forward I/O normalizer:
+      - x_t allowed layouts: [B,C,T,H,W] | [B,T,C,H,W] | [B,C,H,W]
+      - context: Tensor [B,L,D] or [L,D] or list of [L,D]
+      - picks the correct Tensor from model(...) outputs (list/tuple) by energy/shape
+      - returns a Tensor matching x_t's original layout
     """
     pe = getattr(model, "patch_embedding", None)
-    assert pe is not None, "model.patch_embedding not found (Conv3d expected)"
+    assert pe is not None, "model.patch_embedding (Conv3d) not found"
     c_in = int(getattr(pe, "in_channels", 48))
 
-    # ---- normalize x_t to [B,C,T,H,W] and remember original layout ----
+    # ---- 1) Normalize x to [B,C,T,H,W], remember original layout ----
     if x_t.dim() == 5:
-        if x_t.size(1) == c_in:                 # [B,C,T,H,W]
+        if x_t.size(1) == c_in:             # [B,C,T,H,W]
             B, C, T, H, W = x_t.shape
             x_bcthw, orig = x_t, "BCTHW"
-        elif x_t.size(2) == c_in:               # [B,T,C,H,W] -> [B,C,T,H,W]
+        elif x_t.size(2) == c_in:           # [B,T,C,H,W] -> [B,C,T,H,W]
             B, T, C, H, W = x_t.shape
             x_bcthw, orig = x_t.permute(0, 2, 1, 3, 4).contiguous(), "BTCHW"
         else:
-            # Heuristic fallback
+            # Heuristic: assume dim matching common latent widths is channels
             if x_t.size(1) in (16, 32, 48):
                 B, C, T, H, W = x_t.shape
                 x_bcthw, orig = x_t, "BCTHW"
             else:
                 B, T, C, H, W = x_t.shape
                 x_bcthw, orig = x_t.permute(0, 2, 1, 3, 4).contiguous(), "BTCHW"
-    elif x_t.dim() == 4:                        # [B,C,H,W] -> [B,C,1,H,W]
+    elif x_t.dim() == 4:                    # [B,C,H,W] -> [B,C,1,H,W]
         B, C, H, W = x_t.shape
         T = 1
         x_bcthw, orig = x_t.unsqueeze(2).contiguous(), "BCHW"
@@ -338,65 +343,59 @@ def call_dit(model, x_t, t, context, mask=None):
         raise AssertionError(f"Unexpected x_t shape {tuple(x_t.shape)}")
 
     assert x_bcthw.size(1) == c_in, f"Expected channels={c_in}, got {x_bcthw.size(1)}"
+    device = next(model.parameters()).device
+    mdtype = next(model.parameters()).dtype
+    x_bcthw = x_bcthw.to(device=device, dtype=mdtype)
 
-    # ---- compute seq_len from Conv3d output (exact) ----
+    # ---- 2) Compute seq_len EXACTLY from Conv3d patcher ----
     def _as3(v, default):
-        if isinstance(v, int):
-            return (v, v, v)
-        if isinstance(v, (list, tuple)) and len(v) == 3:
-            return tuple(int(x) for x in v)
+        if isinstance(v, int): return (v, v, v)
+        if isinstance(v, (list, tuple)) and len(v) == 3: return tuple(int(x) for x in v)
         return default
 
     kT, kH, kW = _as3(getattr(pe, "kernel_size", (1, 2, 2)), (1, 2, 2))
-    sT, sH, sW = _as3(getattr(pe, "stride", (1, 2, 2)), (1, 2, 2))
-    pT, pH, pW = _as3(getattr(pe, "padding", (0, 0, 0)), (0, 0, 0))
-    dT, dH, dW = _as3(getattr(pe, "dilation", (1, 1, 1)), (1, 1, 1))
+    sT, sH, sW = _as3(getattr(pe, "stride",      (1, 2, 2)), (1, 2, 2))
+    pT, pH, pW = _as3(getattr(pe, "padding",     (0, 0, 0)), (0, 0, 0))
+    dT, dH, dW = _as3(getattr(pe, "dilation",    (1, 1, 1)), (1, 1, 1))
 
-    def _conv_out(n, k, s, p, d):
+    def _conv_out(n, k, s, p, d):  # same as PyTorch formula
         return (n + 2*p - d*(k - 1) - 1) // s + 1
 
     T_out = _conv_out(T, kT, sT, pT, dT)
     H_out = _conv_out(H, kH, sH, pH, dH)
     W_out = _conv_out(W, kW, sW, pW, dW)
     seq_len = int(T_out * H_out * W_out)
-    assert seq_len > 0, f"Invalid seq_len computed: {seq_len} from (T,H,W)=({T},{H},{W})"
+    assert seq_len > 0
 
-    # ---- move/cast to model device/dtype ----
-    device = next(model.parameters()).device
-    mdtype = next(model.parameters()).dtype
-    x_bcthw = x_bcthw.to(device=device, dtype=mdtype)
-
-    # ---- build inputs for forward ----
-    x_list = [x_bcthw[i] for i in range(B)]  # each [C,T,H,W]
+    # ---- 3) Build forward inputs ----
+    x_list = [x_bcthw[i] for i in range(B)]            # each [C,T,H,W]
 
     t = t.reshape(-1).to(device)
-    if t.numel() == 1:
-        t = t.repeat(B)
-    elif t.numel() != B:
-        t = t[:1].repeat(B)
+    if t.numel() == 1:  t = t.repeat(B)
+    elif t.numel() != B: t = t[:1].repeat(B)
 
-    # context -> List[Tensor [L, D_expected]] (pad/trunc last dim)
+    # context -> List[Tensor [L, D_exp]]
     te = getattr(model, "text_embedding", None)
     D_exp = None
     if te is not None:
         for m in te.modules():
             if isinstance(m, torch.nn.Linear):
                 D_exp = int(m.in_features); break
-    if D_exp is None:
-        D_exp = 4096
+    if D_exp is None: D_exp = 4096
 
     def _pad_trunc_lastdim(c: torch.Tensor) -> torch.Tensor:
+        c = c.to(device)
         d = c.size(-1)
         if d == D_exp: return c
-        if d < D_exp:  return F.pad(c, (0, D_exp - d))
+        if d <  D_exp: return F.pad(c, (0, D_exp - d))
         return c[..., :D_exp]
 
     if isinstance(context, torch.Tensor):
-        if context.dim() == 3:  # [B,L,D]
+        if context.dim() == 3:      # [B,L,D]
             context_list = [_pad_trunc_lastdim(context[i]) for i in range(min(B, context.size(0)))]
             if len(context_list) < B:
                 context_list += [context_list[0]] * (B - len(context_list))
-        elif context.dim() == 2:  # [L,D]
+        elif context.dim() == 2:    # [L,D]
             c = _pad_trunc_lastdim(context)
             context_list = [c for _ in range(B)]
         else:
@@ -405,31 +404,67 @@ def call_dit(model, x_t, t, context, mask=None):
         tmp = []
         for c in context:
             c = torch.as_tensor(c, device=device)
-            if c.dim() != 2:
-                raise AssertionError(f"Each context item must be [L,D], got {tuple(c.shape)}")
+            if c.dim() != 2: raise AssertionError(f"Each context item must be [L,D], got {tuple(c.shape)}")
             tmp.append(_pad_trunc_lastdim(c))
-        if len(tmp) != B:
-            tmp = [tmp[0] for _ in range(B)]
+        if len(tmp) != B: tmp = [tmp[0] for _ in range(B)]
         context_list = tmp
 
-    context_list = [c.to(device=device, dtype=mdtype) for c in context_list]
+    context_list = [c.to(dtype=mdtype) for c in context_list]
 
-    # ---- forward ----
+    # ---- 4) Forward ----
     out = model(x_list, t, context_list, seq_len=seq_len)
 
-    # ---- stack outputs and restore original layout ----
-    def _stack_to_bcthw(o):
-        if torch.is_tensor(o):
-            return o if o.dim() == 5 else o.unsqueeze(2)
-        if isinstance(o, (list, tuple)) and len(o) > 0:
-            if isinstance(o[0], (list, tuple)) and torch.is_tensor(o[0][0]):
-                return torch.stack([e[0] for e in o], dim=0)
-            if torch.is_tensor(o[0]):
-                return torch.stack(list(o), dim=0)
-        raise AssertionError(f"Unexpected model output type {type(o)}")
+    # ---- 5) Extract the **prediction tensor** robustly and stack to [B,C,T,H,W] ----
+    def _ensure_5d(x):
+        if x.dim() == 5: return x
+        if x.dim() == 4: return x.unsqueeze(1)   # [C,H,W] -> [C,1,H,W]
+        raise AssertionError(f"Unexpected tensor rank {x.dim()} in model output")
 
-    y_bcthw = _stack_to_bcthw(out)  # [B,C,T,H,W]
+    def _pick_best_tensor(container):
+        # choose the candidate that looks like [C,T,H,W] (C==c_in) and has largest absmean
+        cands = []
+        for item in container:
+            if torch.is_tensor(item):
+                cands.append(item)
+        if not cands:
+            # flatten one level if nested tuples/lists
+            flat = []
+            for item in container:
+                if isinstance(item, (list, tuple)):
+                    flat += [x for x in item if torch.is_tensor(x)]
+            cands = flat
 
+        assert cands, "No tensor candidate found in model outputs"
+        # prefer correct channel dimension
+        scored = []
+        for tns in cands:
+            t5 = _ensure_5d(tns)                      # [C,T?,H,W] -> [C,1,T?,H,W] already handled
+            Ccand = int(t5.size(0))
+            score = float(t5.detach().abs().mean())
+            # bonus if channels match c_in
+            if Ccand == c_in: score *= 10.0
+            scored.append((score, t5))
+        scored.sort(key=lambda z: z[0], reverse=True)
+        return scored[0][1]
+
+    if torch.is_tensor(out):
+        y_bcthw = _ensure_5d(out)
+    elif isinstance(out, (list, tuple)):
+        # list of per-sample outputs; each could be Tensor or tuple/list
+        items = []
+        for s in out:
+            if torch.is_tensor(s):
+                items.append(_ensure_5d(s))
+            elif isinstance(s, (list, tuple)):
+                items.append(_ensure_5d(_pick_best_tensor(s)))
+            else:
+                raise AssertionError(f"Unexpected per-sample output type {type(s)}")
+        # Expect each item [C,T,H,W]; stack to [B,C,T,H,W]
+        y_bcthw = torch.stack(items, dim=0)
+    else:
+        raise AssertionError(f"Unexpected model output type {type(out)}")
+
+    # ---- 6) Restore original layout ----
     if orig == "BCTHW":
         y = y_bcthw
     elif orig == "BTCHW":
@@ -608,6 +643,11 @@ def main(args):
     _ = torch.cuda.amp.GradScaler(enabled=False)  # bf16 uses autocast without scaler
     model.train()
     set_lora_enabled(model, True)
+    
+    trainable = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
+        print(f"[sanity] trainable tensors: {len(trainable)}  total_params={sum(p.numel() for _,p in trainable):,}")
+        for n, p in trainable[:8]:
+            print("   ", n, tuple(p.shape))
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -662,6 +702,14 @@ def main(args):
                 scaler.scale(loss).backward()
             else:
                 loss.backward()
+            
+            if step % 200 == 0:
+                gmeans = []
+                for n, p in model.named_parameters():
+                    if p.requires_grad and (p.grad is not None):
+                        gmeans.append(p.grad.detach().abs().mean().item())
+                if gmeans:
+                    print(f"[grads] mean(|grad|)={sum(gmeans)/len(gmeans):.3e} over {len(gmeans)} tensors")
 
             # Gradient step on accumulation boundary:
             if (step + 1) % args.grad_accum == 0:
