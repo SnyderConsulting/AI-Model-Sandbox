@@ -309,17 +309,15 @@ def _apply_filtered_state(model: nn.Module, state: Dict[str, torch.Tensor]) -> N
 
 def call_dit(model, x_t, t, context, mask=None):
     """
-    WanModel.forward I/O normalizer:
-      - x_t allowed layouts: [B,C,T,H,W] | [B,T,C,H,W] | [B,C,H,W]
-      - context: Tensor [B,L,D] or [L,D] or list of [L,D]
-      - picks the correct Tensor from model(...) outputs (list/tuple) by energy/shape
-      - returns a Tensor matching x_t's original layout
+    Normalizes inputs for WanModel.forward, computes seq_len from Conv3d patcher,
+    picks the correct prediction tensor from outputs, and returns a Tensor with
+    the same layout as x_t.
     """
     pe = getattr(model, "patch_embedding", None)
     assert pe is not None, "model.patch_embedding (Conv3d) not found"
     c_in = int(getattr(pe, "in_channels", 48))
 
-    # ---- 1) Normalize x to [B,C,T,H,W], remember original layout ----
+    # ---- 1) Normalize x_t to [B,C,T,H,W], remember original layout ----
     if x_t.dim() == 5:
         if x_t.size(1) == c_in:             # [B,C,T,H,W]
             B, C, T, H, W = x_t.shape
@@ -328,7 +326,7 @@ def call_dit(model, x_t, t, context, mask=None):
             B, T, C, H, W = x_t.shape
             x_bcthw, orig = x_t.permute(0, 2, 1, 3, 4).contiguous(), "BTCHW"
         else:
-            # Heuristic: assume dim matching common latent widths is channels
+            # Heuristic fallback
             if x_t.size(1) in (16, 32, 48):
                 B, C, T, H, W = x_t.shape
                 x_bcthw, orig = x_t, "BCTHW"
@@ -347,25 +345,18 @@ def call_dit(model, x_t, t, context, mask=None):
     mdtype = next(model.parameters()).dtype
     x_bcthw = x_bcthw.to(device=device, dtype=mdtype)
 
-    # ---- 2) Compute seq_len EXACTLY from Conv3d patcher ----
+    # ---- 2) seq_len from Conv3d patcher (exact) ----
     def _as3(v, default):
         if isinstance(v, int): return (v, v, v)
         if isinstance(v, (list, tuple)) and len(v) == 3: return tuple(int(x) for x in v)
         return default
-
     kT, kH, kW = _as3(getattr(pe, "kernel_size", (1, 2, 2)), (1, 2, 2))
     sT, sH, sW = _as3(getattr(pe, "stride",      (1, 2, 2)), (1, 2, 2))
     pT, pH, pW = _as3(getattr(pe, "padding",     (0, 0, 0)), (0, 0, 0))
     dT, dH, dW = _as3(getattr(pe, "dilation",    (1, 1, 1)), (1, 1, 1))
-
-    def _conv_out(n, k, s, p, d):  # same as PyTorch formula
-        return (n + 2*p - d*(k - 1) - 1) // s + 1
-
-    T_out = _conv_out(T, kT, sT, pT, dT)
-    H_out = _conv_out(H, kH, sH, pH, dH)
-    W_out = _conv_out(W, kW, sW, pW, dW)
-    seq_len = int(T_out * H_out * W_out)
-    assert seq_len > 0
+    def _conv_out(n, k, s, p, d): return (n + 2*p - d*(k - 1) - 1) // s + 1
+    T_out = _conv_out(T, kT, sT, pT, dT); H_out = _conv_out(H, kH, sH, pH, dH); W_out = _conv_out(W, kW, sW, pW, dW)
+    seq_len = int(T_out * H_out * W_out); assert seq_len > 0
 
     # ---- 3) Build forward inputs ----
     x_list = [x_bcthw[i] for i in range(B)]            # each [C,T,H,W]
@@ -414,52 +405,59 @@ def call_dit(model, x_t, t, context, mask=None):
     # ---- 4) Forward ----
     out = model(x_list, t, context_list, seq_len=seq_len)
 
-    # ---- 5) Extract the **prediction tensor** robustly and stack to [B,C,T,H,W] ----
-    def _ensure_5d(x):
-        if x.dim() == 5: return x
-        if x.dim() == 4: return x.unsqueeze(1)   # [C,H,W] -> [C,1,H,W]
-        raise AssertionError(f"Unexpected tensor rank {x.dim()} in model output")
+    # ---- 5) Extract prediction tensor and stack correctly ----
+    def _ensure_4d_sample(x):
+        """Per-sample: want [C,T,H,W]. If [C,H,W], add T=1; if [1,C,T,H,W], squeeze B."""
+        if x.dim() == 4:                      # [C,T,H,W]
+            return x
+        if x.dim() == 3:                      # [C,H,W] -> [C,1,H,W]
+            return x.unsqueeze(1)
+        if x.dim() == 5 and x.size(0) == 1 and x.size(1) == c_in:  # [1,C,T,H,W]
+            return x.squeeze(0)
+        raise AssertionError(f"Unexpected per-sample tensor rank {x.dim()} in model output")
 
-    def _pick_best_tensor(container):
-        # choose the candidate that looks like [C,T,H,W] (C==c_in) and has largest absmean
+    def _pick_best_sample_tensor(container):
+        # Flatten one level and pick best by abs-mean, preferring channel match.
         cands = []
-        for item in container:
-            if torch.is_tensor(item):
-                cands.append(item)
-        if not cands:
-            # flatten one level if nested tuples/lists
-            flat = []
-            for item in container:
-                if isinstance(item, (list, tuple)):
-                    flat += [x for x in item if torch.is_tensor(x)]
-            cands = flat
-
+        def _collect(z):
+            if torch.is_tensor(z):
+                cands.append(z)
+            elif isinstance(z, (list, tuple)):
+                for y in z: _collect(y)
+        _collect(container)
         assert cands, "No tensor candidate found in model outputs"
-        # prefer correct channel dimension
-        scored = []
+
+        best, best_score = None, -1.0
         for tns in cands:
-            t5 = _ensure_5d(tns)                      # [C,T?,H,W] -> [C,1,T?,H,W] already handled
-            Ccand = int(t5.size(0))
-            score = float(t5.detach().abs().mean())
-            # bonus if channels match c_in
-            if Ccand == c_in: score *= 10.0
-            scored.append((score, t5))
-        scored.sort(key=lambda z: z[0], reverse=True)
-        return scored[0][1]
+            # Score
+            score = float(tns.detach().abs().mean())
+            # Bonus if the first dim (or second when batched sample) equals c_in
+            bonus = 0.0
+            if tns.dim() == 4 and tns.size(0) == c_in: bonus = 10.0
+            if tns.dim() == 5 and tns.size(0) == 1 and tns.size(1) == c_in: bonus = 10.0
+            sc = score * (1.0 + bonus)
+            if sc > best_score:
+                try:
+                    candidate = _ensure_4d_sample(tns)
+                    best, best_score = candidate, sc
+                except AssertionError:
+                    continue
+        assert best is not None, "Failed to coerce any model output to [C,T,H,W]"
+        return best
 
     if torch.is_tensor(out):
-        y_bcthw = _ensure_5d(out)
+        # Batched: want [B,C,T,H,W]. If [B,C,H,W], add T=1 at dim=2.
+        if out.dim() == 5:
+            y_bcthw = out
+        elif out.dim() == 4:
+            y_bcthw = out.unsqueeze(2)        # [B,C,H,W] -> [B,C,1,H,W]
+        else:
+            raise AssertionError(f"Unexpected batched output rank {out.dim()}")
     elif isinstance(out, (list, tuple)):
-        # list of per-sample outputs; each could be Tensor or tuple/list
+        # Per-sample outputs: each to [C,T,H,W], then stack to [B,C,T,H,W]
         items = []
         for s in out:
-            if torch.is_tensor(s):
-                items.append(_ensure_5d(s))
-            elif isinstance(s, (list, tuple)):
-                items.append(_ensure_5d(_pick_best_tensor(s)))
-            else:
-                raise AssertionError(f"Unexpected per-sample output type {type(s)}")
-        # Expect each item [C,T,H,W]; stack to [B,C,T,H,W]
+            items.append(_pick_best_sample_tensor(s))
         y_bcthw = torch.stack(items, dim=0)
     else:
         raise AssertionError(f"Unexpected model output type {type(out)}")
@@ -651,6 +649,10 @@ def main(args):
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    
+    # ==== USAGE IN TRAIN LOOP (replace your loss/backward block) ====
+    # After you have constructed model/vae/optimizer and parsed args:
+    AMP_DTYPE, scaler = setup_amp_and_models(args, model, vae)
 
     step = 0
     running = 0.0
@@ -683,18 +685,11 @@ def main(args):
 
             # flow-matching pair
             x_t, v, t = make_velocity_training_pair(x1)  # x_t/v are dtype=dtype
-           
-           
-           
-           # ==== USAGE IN TRAIN LOOP (replace your loss/backward block) ====
-            # After you have constructed model/vae/optimizer and parsed args:
-            AMP_DTYPE, scaler = setup_amp_and_models(args, model, vae)
 
-            # In your training iteration:
             with torch.amp.autocast('cuda', dtype=AMP_DTYPE):
                 pred = call_dit(model, x_t, t, context, mask)
                 mse_fp32 = F.mse_loss(pred.float(), v.float())
-                loss = (mse_fp32 / args.grad_accum)
+                loss = mse_fp32 / args.grad_accum
 
             debug_step(step, vids=vids, x1=x1, x_t=x_t, v=v, pred=pred, loss=loss.detach(), t=t, model=model, grad_accum=args.grad_accum, every=200)
 
