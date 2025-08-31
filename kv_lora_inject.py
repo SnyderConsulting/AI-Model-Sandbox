@@ -114,6 +114,11 @@ def inject_lora_kv(
             if hasattr(ca, tgt):
                 path = f"{blocks_attr}.{i}.{cross_attr}.{tgt}"
                 loras[path] = _replace_linear_with_lora(ca, tgt, rank, alpha, dropout)
+                
+    for fused in ("qkv", "in_proj", "proj_in"):
+    if hasattr(ca, fused) and isinstance(getattr(ca, fused), nn.Linear):
+        path = f"{blocks_attr}.{i}.{cross_attr}.{fused}"
+        loras[path] = _replace_linear_with_lora(ca, fused, rank, alpha, dropout)
     return loras
 
 

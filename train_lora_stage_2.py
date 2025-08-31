@@ -296,15 +296,20 @@ def _load_filtered_state(
 
 
 def _apply_filtered_state(model: nn.Module, state: Dict[str, torch.Tensor]) -> None:
-    # Load only the keys we need (as Stage-1 did): text_embedding + attn projections.
+    # OLD: only text_embedding + cross_attn
+    # NEW: at least also load head + patch embedding
     keep = {}
     for k, v in state.items():
-        if (".cross_attn." in k) or k.startswith("text_embedding"):
+        if (
+            k.startswith("text_embedding")
+            or ".cross_attn." in k
+            or k.startswith("patch_embedding")
+            or k.startswith("head.")
+        ):
             keep[k] = v
     missing, unexpected = model.load_state_dict(keep, strict=False)
-    if False:  # debug
-        print("missing:", missing)
-        print("unexpected:", unexpected)
+    print(f"[load] loaded {len(state)} keys; missing={len(missing)} unexpected={len(unexpected)}")
+    print("[head abs-mean]", float(model.head.head.weight.abs().mean()))
 
 
 def call_dit(model, x_t, t, context, mask=None):
@@ -436,6 +441,8 @@ def call_dit(model, x_t, t, context, mask=None):
             if tns.dim() == 4 and tns.size(0) == c_in: bonus = 10.0
             if tns.dim() == 5 and tns.size(0) == 1 and tns.size(1) == c_in: bonus = 10.0
             sc = score * (1.0 + bonus)
+            
+            print("cand", tns.shape, "absmean=", float(tns.detach().abs().mean()), "bonus=", bonus, "score=", sc)
             if sc > best_score:
                 try:
                     candidate = _ensure_4d_sample(tns)
@@ -581,6 +588,13 @@ def main(args):
         dropout=0.0,
         blocks_range=None,
     )
+    
+    hit_counts = {}
+    def _fw_hook(mod, inp, out):
+        hit_counts[id(mod)] = hit_counts.get(id(mod), 0) + 1
+    for m in model.modules():
+        if isinstance(m, LoRALinear):
+            m.register_forward_hook(_fw_hook)
 
     # Resume from Stage-1 adapter (KV only) if provided
     if args.resume_adapter and os.path.exists(args.resume_adapter):
@@ -679,9 +693,9 @@ def main(args):
             context = tokens  # [B,L,d_model]
 
             # encode latents
-            vids = vids.to(dtype=torch.float32)  # VAE usually wants fp32
-            x1 = encode_pixels_to_latents(vae, vids)  # shape [B,1+T/4,16,H',W']
-            x1 = x1.to(device=device, dtype=dtype)
+            vids = vids.to(torch.float32)
+            vids = vids * 2.0 - 1.0  # [0,1] -> [-1,1]
+            x1 = encode_pixels_to_latents(vae, vids)
 
             # flow-matching pair
             x_t, v, t = make_velocity_training_pair(x1)  # x_t/v are dtype=dtype
@@ -697,6 +711,8 @@ def main(args):
                 scaler.scale(loss).backward()
             else:
                 loss.backward()
+            
+            print("[lora] modules hit in forward:", sum(hit_counts.values()), "unique:", len(hit_counts))
             
             if step % 200 == 0:
                 gmeans = []
