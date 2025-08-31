@@ -645,9 +645,9 @@ def main(args):
     set_lora_enabled(model, True)
     
     trainable = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
-        print(f"[sanity] trainable tensors: {len(trainable)}  total_params={sum(p.numel() for _,p in trainable):,}")
-        for n, p in trainable[:8]:
-            print("   ", n, tuple(p.shape))
+    print(f"[sanity] trainable tensors: {len(trainable)}  total_params={sum(p.numel() for _,p in trainable):,}")
+    for n, p in trainable[:8]:
+        print("   ", n, tuple(p.shape))
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
