@@ -613,11 +613,11 @@ def main(args):
             # Gradient step on accumulation boundary:
             if (step + 1) % args.grad_accum == 0:
                 if scaler.is_enabled():
-                    scaler.step(optimizer)
+                    scaler.step(opt)
                     scaler.update()
                 else:
-                    optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
+                    opt.step()
+                opt.zero_grad(set_to_none=True)
            
            
 
