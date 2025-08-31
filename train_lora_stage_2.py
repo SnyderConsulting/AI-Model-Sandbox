@@ -44,6 +44,49 @@ import math
 import argparse
 
 
+
+def _tstats(x: torch.Tensor):
+    x = x.detach().float()
+    return {
+        "shape": tuple(x.shape),
+        "mean": float(x.mean()),
+        "std": float(x.std(unbiased=False)),
+        "absmean": float(x.abs().mean()),
+        "min": float(x.min()),
+        "max": float(x.max()),
+        "nonzero_%": float((x != 0).float().mean()) * 100.0,
+    }
+
+def debug_step(step, vids=None, x1=None, x_t=None, v=None, pred=None, loss=None, t=None, model=None, grad_accum=1, every=200):
+    if step % every != 0:
+        return
+    print(f"\n[debug] step={step} grad_accum={grad_accum}")
+    if vids is not None:  print("vids     ", _tstats(vids))
+    if x1 is not None:    print("latents x1", _tstats(x1))
+    if x_t is not None:   print("x_t      ", _tstats(x_t))
+    if v is not None:     print("v        ", _tstats(v))
+    if pred is not None:  print("pred     ", _tstats(pred))
+    if t is not None:
+        try:
+            tu = torch.unique(t.detach().to(torch.int64), sorted=True)
+            print("t unique (first 8):", tu[:8].tolist(), " total:", int(tu.numel()))
+        except Exception:
+            pass
+    if (pred is not None) and (v is not None):
+        raw_mse = F.mse_loss(pred.float(), v.float()).item()
+        print(f"raw_mse(fp32)={raw_mse:.8f}  scaled(raw_mse/accum)={raw_mse/grad_accum:.8f}")
+    if loss is not None and torch.is_tensor(loss):
+        print(f"reported loss tensor={float(loss):.8f}")
+    if model is not None:
+        gmeans = []
+        for n, p in model.named_parameters():
+            if p.requires_grad and (p.grad is not None):
+                gmeans.append(p.grad.detach().abs().mean().item())
+        if gmeans:
+            print(f"grad_abs_mean={sum(gmeans)/len(gmeans):.8e} over {len(gmeans)} trainable params")
+
+
+
 def setup_amp_and_models(args, model, vae):
     want_bf16 = bool(getattr(args, 'bf16', False)) or os.environ.get('WAN_BRIDGE_DTYPE', '').lower() == 'bf16'
     bf16_ok = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
@@ -578,6 +621,13 @@ def main(args):
                 break
             vids = batch["pixel"].to(device)  # [B,T,3,H,W]
             caps: List[str] = batch["caption"]
+            
+            if step == 0:
+                try:
+                    print("[once] vids shape/dtype:", tuple(vids.shape), vids.dtype,
+                          " min/max:", float(vids.min()), float(vids.max()))
+                except Exception:
+                    pass
 
             # text → tokens → context
             tokens_list = bridge(caps, device)  # list of [L_i, d]
@@ -603,7 +653,10 @@ def main(args):
             # In your training iteration:
             with torch.amp.autocast('cuda', dtype=AMP_DTYPE):
                 pred = call_dit(model, x_t, t, context, mask)
-                loss = F.mse_loss(pred, v) / args.grad_accum
+                mse_fp32 = F.mse_loss(pred.float(), v.float())
+                loss = (mse_fp32 / args.grad_accum)
+
+            debug_step(step, vids=vids, x1=x1, x_t=x_t, v=v, pred=pred, loss=loss.detach(), t=t, model=model, grad_accum=args.grad_accum, every=200)
 
             if scaler.is_enabled():
                 scaler.scale(loss).backward()
@@ -625,7 +678,10 @@ def main(args):
             pbar.update(1)
             if step % args.log_every == 0:
                 avg = running / args.log_every
-                pbar.set_postfix(loss=f"{avg:.4f}")
+                try:
+                    pbar.set_postfix(mse=f"{mse_fp32.item():.6f}", loss=f"{(mse_fp32.item()/args.grad_accum):.8f}")
+                except Exception:
+                    pass
                 running = 0.0
 
             if step % args.save_every == 0 or step == args.steps:
