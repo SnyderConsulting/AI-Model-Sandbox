@@ -29,6 +29,7 @@ from tqdm import tqdm
 
 from kv_lora_inject import (
     inject_lora_kv,
+    inject_lora_visual,
     set_lora_enabled,
     load_peft_adapter,
     export_peft_adapter,
@@ -222,6 +223,16 @@ def build_argparser():
         type=float,
         default=None,
         help="Learning rate for visual LoRA layers (self-attn/ffn).",
+    )
+    p.add_argument(
+        "--enable_self_attn",
+        action="store_true",
+        help="Inject LoRA into blocks.*.attn.{q,k,v,o}",
+    )
+    p.add_argument(
+        "--enable_ffn",
+        action="store_true",
+        help="Inject LoRA into blocks.*.ffn linears",
     )
     p.add_argument(
         "--resume_adapter",
@@ -668,6 +679,19 @@ def main(args):
         dropout=0.0,
         blocks_range=None,
     )
+    if args.enable_self_attn or args.enable_ffn:
+        inject_lora_visual(
+            model,
+            blocks_attr="blocks",
+            attn_attr="attn",
+            ffn_attr="ffn",
+            targets=targets,
+            rank=args.rank,
+            alpha=args.alpha,
+            dropout=0.0,
+            enable_attn=args.enable_self_attn,
+            enable_ffn=args.enable_ffn,
+        )
 
     hit_counts = {}
 
