@@ -126,6 +126,61 @@ def inject_lora_kv(
     return loras
 
 
+def inject_lora_visual(
+    model: nn.Module,
+    blocks_attr: str = "blocks",
+    attn_attr: str = "attn",
+    ffn_attr: str = "ffn",
+    targets: Tuple[str, ...] = ("q", "k", "v", "o"),
+    rank: int = 8,
+    alpha: float = 32.0,
+    dropout: float = 0.0,
+    blocks_range: Tuple[int, int] | None = None,
+    enable_attn: bool = True,
+    enable_ffn: bool = False,
+) -> Dict[str, LoRALinear]:
+    """Inject LoRA into visual (self-attn and FFN) pathways.
+
+    When ``enable_attn`` is True, targets ``blocks.*.attn.{q,k,v,o}`` and fused
+    projections are wrapped with :class:`LoRALinear`. When ``enable_ffn`` is
+    True, all direct ``nn.Linear`` children of ``blocks.*.ffn`` are wrapped.
+    Returns a dict mapping module path -> :class:`LoRALinear`.
+    """
+
+    loras: Dict[str, LoRALinear] = {}
+    blocks = getattr(model, blocks_attr)
+    n = len(blocks)
+    start, end = (0, n - 1) if blocks_range is None else blocks_range
+    for i in range(start, end + 1):
+        blk = blocks[i]
+        if enable_attn:
+            sa = getattr(blk, attn_attr, None)
+            if sa is not None:
+                for tgt in targets:
+                    if hasattr(sa, tgt):
+                        path = f"{blocks_attr}.{i}.{attn_attr}.{tgt}"
+                        loras[path] = _replace_linear_with_lora(
+                            sa, tgt, rank, alpha, dropout
+                        )
+                for fused in ("qkv", "in_proj", "proj_in"):
+                    if hasattr(sa, fused) and isinstance(getattr(sa, fused), nn.Linear):
+                        path = f"{blocks_attr}.{i}.{attn_attr}.{fused}"
+                        loras[path] = _replace_linear_with_lora(
+                            sa, fused, rank, alpha, dropout
+                        )
+
+        if enable_ffn:
+            ffn = getattr(blk, ffn_attr, None)
+            if ffn is not None:
+                for name, child in ffn.named_children():
+                    if isinstance(child, nn.Linear):
+                        path = f"{blocks_attr}.{i}.{ffn_attr}.{name}"
+                        loras[path] = _replace_linear_with_lora(
+                            ffn, name, rank, alpha, dropout
+                        )
+    return loras
+
+
 def set_lora_enabled(model: nn.Module, enabled: bool = True):
     for m in model.modules():
         if isinstance(m, LoRALinear):
