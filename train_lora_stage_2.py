@@ -240,51 +240,71 @@ def _apply_filtered_state(model: nn.Module, state: Dict[str, torch.Tensor]) -> N
 
 def call_dit(model, x_t, t, context, mask=None):
     """
-    Normalizes inputs for WanModel.forward and returns a tensor with the SAME shape/layout as x_t
-    so that `F.mse_loss(pred, v)` works (no lists).
-
-    Accepts x_t as:
-      - [B, C, T, H, W]  or  [B, T, C, H, W]  or  [B, C, H, W]
+    Normalizes inputs for WanModel.forward, using model.patch_embedding.in_channels to
+    disambiguate channel-vs-time. Returns a tensor matching the original x_t layout
+    so mse_loss(pred, v) works.
     """
-    # ---- 1) Normalize x to [B, C, T, H, W] and remember original layout ----
-    if x_t.dim() == 5:
-        if x_t.size(1) in (1, 3, 16, 32, 48):     # [B,C,T,H,W]
-            B, C, T, H, W = x_t.shape
-            x_bcthw = x_t
-            orig = "BCTHW"
-        else:                                      # [B,T,C,H,W] -> [B,C,T,H,W]
-            B, T, C, H, W = x_t.shape
-            x_bcthw = x_t.permute(0, 2, 1, 3, 4).contiguous()
-            orig = "BTCHW"
-    elif x_t.dim() == 4:                           # [B,C,H,W] -> add T=1
-        B, C, H, W = x_t.shape
-        T = 1
-        x_bcthw = x_t.unsqueeze(2).contiguous()
-        orig = "BCHW"
-    else:
-        raise AssertionError(f"Unexpected x_t shape {tuple(x_t.shape)}")
-
-    # ---- 2) Compute seq_len (use ceil so seq_lens.max() <= seq_len holds safely) ----
+    # -------- model patch embed config --------
     pe = getattr(model, "patch_embedding", None)
+    c_in = int(getattr(pe, "in_channels", 48))  # default to 48 if not exposed
     ks = getattr(pe, "kernel_size", (1, 2, 2))
     if isinstance(ks, int):
         ks = (1, ks, ks)
     pt, ph, pw = map(int, ks)
-    seq_len = math.ceil(T / pt) * math.ceil(H / ph) * math.ceil(W / pw)
 
-    # ---- 3) Make the inputs WanModel.forward expects ----
-    # x: List[Tensor [C,F,H,W]]
-    x_list = [x_bcthw[i] for i in range(B)]  # each [C,T,H,W]
+    # -------- normalize x to [B, C, T, H, W] while preserving original layout --------
+    if x_t.dim() == 5:
+        B = x_t.size(0)
+        # Prefer the axis that matches the model's expected input channels
+        if x_t.size(1) == c_in:                 # [B, C, T, H, W]
+            B, C, T, H, W = x_t.shape
+            x_bcthw, orig = x_t, "BCTHW"
+        elif x_t.size(2) == c_in:               # [B, T, C, H, W] -> [B, C, T, H, W]
+            B, T, C, H, W = x_t.shape
+            x_bcthw, orig = x_t.permute(0, 2, 1, 3, 4).contiguous(), "BTCHW"
+        else:
+            # Fallback heuristic: take the larger of dims 1/2 as channels if it equals a common latent width
+            if x_t.size(1) in (16, 32, 48):
+                B, C, T, H, W = x_t.shape
+                x_bcthw, orig = x_t, "BCTHW"
+            elif x_t.size(2) in (16, 32, 48):
+                B, T, C, H, W = x_t.shape
+                x_bcthw, orig = x_t.permute(0, 2, 1, 3, 4).contiguous(), "BTCHW"
+            else:
+                # Last resort: if one dim is 1 and the other is not, treat the non-1 as channels
+                if x_t.size(1) == 1 and x_t.size(2) != 1:
+                    B, T, C, H, W = x_t.shape
+                    x_bcthw, orig = x_t.permute(0, 2, 1, 3, 4).contiguous(), "BTCHW"
+                else:
+                    B, C, T, H, W = x_t.shape
+                    x_bcthw, orig = x_t, "BCTHW"
+    elif x_t.dim() == 4:                         # [B, C, H, W] -> add T=1
+        B, C, H, W = x_t.shape
+        T = 1
+        x_bcthw, orig = x_t.unsqueeze(2).contiguous(), "BCHW"
+    else:
+        raise AssertionError(f"Unexpected x_t shape {tuple(x_t.shape)}")
+
+    # Sanity check: channels must match the conv3d's expected in_channels
+    assert x_bcthw.size(1) == c_in, f"Expected channels={c_in}, got {x_bcthw.size(1)}; check latent packing."
+
+    # -------- seq_len = product of patchified dims --------
+    # For patchify conv (stride==kernel, no padding) this equals (T//pt)*(H//ph)*(W//pw)
+    seq_len = (T // pt) * (H // ph) * (W // pw)
+
+    # -------- build WanModel.forward inputs --------
+    x_list = [x_bcthw[i] for i in range(B)]  # each item: [C, T, H, W]
 
     # t: Tensor[B]
-    t = t.reshape(-1).to(x_bcthw.device)
+    device = next(model.parameters()).device
+    dtype  = next(model.parameters()).dtype
+    t = t.reshape(-1).to(device)
     if t.numel() == 1:
         t = t.repeat(B)
     elif t.numel() != B:
         t = t[:1].repeat(B)
 
     # context: List[Tensor [L, D_expected]]
-    # infer expected embedding input dim (fallback 4096)
     def _ctx_in_features():
         te = getattr(model, "text_embedding", None)
         if te is not None:
@@ -294,58 +314,51 @@ def call_dit(model, x_t, t, context, mask=None):
         return 4096
     D_exp = _ctx_in_features()
 
-    def _pad_trunc_lastdim(tns):
-        d = tns.size(-1)
-        if d == D_exp:
-            return tns
-        if d < D_exp:
-            return F.pad(tns, (0, D_exp - d))
-        return tns[..., :D_exp]
+    def _pad_trunc_lastdim(c: torch.Tensor) -> torch.Tensor:
+        d = c.size(-1)
+        if d == D_exp: return c
+        if d < D_exp:  return F.pad(c, (0, D_exp - d))
+        return c[..., :D_exp]
 
     if isinstance(context, torch.Tensor):
-        if context.dim() == 3:  # [B,L,D]
+        if context.dim() == 3:      # [B, L, D]
             context_list = [_pad_trunc_lastdim(context[i]) for i in range(B)]
-        elif context.dim() == 2:  # [L,D]
+        elif context.dim() == 2:    # [L, D]
             c = _pad_trunc_lastdim(context)
             context_list = [c for _ in range(B)]
         else:
             raise AssertionError(f"Unexpected context tensor shape {tuple(context.shape)}")
-    elif isinstance(context, (list, tuple)):
+    else:
+        # list/tuple of [L, D]
         tmp = []
         for c in context:
-            c = torch.as_tensor(c, device=x_bcthw.device)
+            c = torch.as_tensor(c, device=device)
             if c.dim() != 2:
                 raise AssertionError(f"Each context item must be [L,D], got {tuple(c.shape)}")
             tmp.append(_pad_trunc_lastdim(c))
         if len(tmp) != B:
             tmp = [tmp[0] for _ in range(B)]
         context_list = tmp
-    else:
-        raise AssertionError("context must be a Tensor or a list/tuple of Tensors")
 
-    # move contexts to model device/dtype
-    device = next(model.parameters()).device
-    dtype  = next(model.parameters()).dtype
     context_list = [c.to(device=device, dtype=dtype) for c in context_list]
 
-    # ---- 4) Forward (this Wan build does not accept 'mask') ----
-    out = model(x_list, t.to(device), context_list, seq_len=seq_len)
+    # -------- forward --------
+    out = model(x_list, t, context_list, seq_len=seq_len)
 
-    # ---- 5) Convert model output to a **tensor** and restore original layout ----
+    # -------- convert output to tensor and restore original layout --------
     def _stack_to_bcthw(o):
-        # Handles: list[Tensor [C,T,H,W]], list[(Tensor,...)]
         if torch.is_tensor(o):
-            if o.dim() == 5:         # [B,C,T,H,W]
+            if o.dim() == 5:   # [B,C,T,H,W]
                 return o
-            if o.dim() == 4:         # [B,C,H,W] -> add T=1
+            if o.dim() == 4:   # [B,C,H,W] -> add T=1
                 return o.unsqueeze(2)
             raise AssertionError(f"Unexpected tensor output shape {tuple(o.shape)}")
         if isinstance(o, (list, tuple)) and len(o) > 0:
-            first = o[0][0] if (isinstance(o[0], (list, tuple)) and torch.is_tensor(o[0][0])) else o[0]
+            fst = o[0][0] if (isinstance(o[0], (list, tuple)) and torch.is_tensor(o[0][0])) else o[0]
             if isinstance(o[0], (list, tuple)) and torch.is_tensor(o[0][0]):
-                return torch.stack([elem[0] for elem in o], dim=0)
-            if torch.is_tensor(first):
-                return torch.stack(list(o), dim=0)
+                return torch.stack([e[0] for e in o], dim=0)  # list[(Tensor,...)]
+            if torch.is_tensor(fst):
+                return torch.stack(list(o), dim=0)            # list[Tensor]
         raise AssertionError(f"Unexpected model output type {type(o)}")
 
     y_bcthw = _stack_to_bcthw(out)  # [B,C,T,H,W]
