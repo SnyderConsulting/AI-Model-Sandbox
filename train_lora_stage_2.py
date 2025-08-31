@@ -584,7 +584,7 @@ def main(args):
             tokens, mask = pad_stack(tokens_list, args.text_len)  # [B,L,d], [B,L,1]
             tokens = tokens.to(device=device, dtype=dtype)
             mask = mask.to(device=device, dtype=torch.float32)
-            context = model.text_embedding(tokens.float())  # [B,L,d_model]
+            context = tokens  # [B,L,d_model]
 
             # encode latents
             vids = vids.to(dtype=torch.float32)  # VAE usually wants fp32
