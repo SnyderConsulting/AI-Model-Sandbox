@@ -97,9 +97,13 @@ def inject_lora_kv(
     blocks_range: Tuple[int, int] | None = None,
 ) -> Dict[str, LoRALinear]:
     """
-    Replace cross-attn .k and .v linears with LoRALinear in all WanAttentionBlocks.
+    Replace target projections in cross-attention blocks with ``LoRALinear``.
 
-    Returns: dict mapping module path -> LoRALinear
+    By default this covers ``q``, ``k``, ``v`` and ``o`` projections. Fused
+    projections (``qkv``, ``in_proj``, ``proj_in``) are also handled when
+    present.
+
+    Returns: dict mapping module path -> ``LoRALinear``
     """
     loras: Dict[str, LoRALinear] = {}
     blocks = getattr(model, blocks_attr)
@@ -114,11 +118,11 @@ def inject_lora_kv(
             if hasattr(ca, tgt):
                 path = f"{blocks_attr}.{i}.{cross_attr}.{tgt}"
                 loras[path] = _replace_linear_with_lora(ca, tgt, rank, alpha, dropout)
-                
-    for fused in ("qkv", "in_proj", "proj_in"):
-        if hasattr(ca, fused) and isinstance(getattr(ca, fused), nn.Linear):
-            path = f"{blocks_attr}.{i}.{cross_attr}.{fused}"
-            loras[path] = _replace_linear_with_lora(ca, fused, rank, alpha, dropout)
+
+        for fused in ("qkv", "in_proj", "proj_in"):
+            if hasattr(ca, fused) and isinstance(getattr(ca, fused), nn.Linear):
+                path = f"{blocks_attr}.{i}.{cross_attr}.{fused}"
+                loras[path] = _replace_linear_with_lora(ca, fused, rank, alpha, dropout)
     return loras
 
 

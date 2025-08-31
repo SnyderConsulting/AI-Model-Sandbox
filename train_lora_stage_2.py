@@ -30,7 +30,6 @@ from tqdm import tqdm
 from kv_lora_inject import (
     inject_lora_kv,
     set_lora_enabled,
-    lora_parameters,
     load_peft_adapter,
     export_peft_adapter,
     LoRALinear,
@@ -38,11 +37,8 @@ from kv_lora_inject import (
 from mixed_media import MixedCaptioned, BucketBatchSampler
 from wan_vae_loader import load_wan_vae
 
-import math
-
 # --- Configuration / args
 import argparse
-
 
 
 def _tstats(x: torch.Tensor):
@@ -57,28 +53,54 @@ def _tstats(x: torch.Tensor):
         "nonzero_%": float((x != 0).float().mean()) * 100.0,
     }
 
-def debug_step(step, vids=None, x1=None, x_t=None, v=None, pred=None, loss=None, t=None, model=None, grad_accum=1, every=200):
+
+def debug_step(
+    step,
+    vids=None,
+    x1=None,
+    x_t=None,
+    v=None,
+    pred=None,
+    loss=None,
+    t=None,
+    model=None,
+    grad_accum=1,
+    every=200,
+):
     if step % every != 0:
         return
     print(f"\n[debug] step={step} grad_accum={grad_accum}")
-    if vids is not None:  print("vids     ", _tstats(vids))
-    if x1 is not None:    print("latents x1", _tstats(x1))
-    if x_t is not None:   print("x_t      ", _tstats(x_t))
-    if v is not None:     print("v        ", _tstats(v))
-    if pred is not None:  print("pred     ", _tstats(pred))
+    if vids is not None:
+        print("vids     ", _tstats(vids))
+    if x1 is not None:
+        print("latents x1", _tstats(x1))
+    if x_t is not None:
+        print("x_t      ", _tstats(x_t))
+    if v is not None:
+        print("v        ", _tstats(v))
+    if pred is not None:
+        print("pred     ", _tstats(pred))
     if t is not None:
         try:
             tu = torch.unique(t.detach().to(torch.int64), sorted=True)
             print("t unique (first 8):", tu[:8].tolist(), " total:", int(tu.numel()))
-            print("[t] mean=", float(t.detach().float().mean()),
-                "std=", float(t.detach().float().std(unbiased=False)),
-                "min=", float(t.detach().float().min()),
-                "max=", float(t.detach().float().max()))
+            print(
+                "[t] mean=",
+                float(t.detach().float().mean()),
+                "std=",
+                float(t.detach().float().std(unbiased=False)),
+                "min=",
+                float(t.detach().float().min()),
+                "max=",
+                float(t.detach().float().max()),
+            )
         except Exception:
             pass
     if (pred is not None) and (v is not None):
         raw_mse = F.mse_loss(pred.float(), v.float()).item()
-        print(f"raw_mse(fp32)={raw_mse:.8f}  scaled(raw_mse/accum)={raw_mse/grad_accum:.8f}")
+        print(
+            f"raw_mse(fp32)={raw_mse:.8f}  scaled(raw_mse/accum)={raw_mse/grad_accum:.8f}"
+        )
     if loss is not None and torch.is_tensor(loss):
         print(f"reported loss tensor={float(loss):.8f}")
     if model is not None:
@@ -87,12 +109,16 @@ def debug_step(step, vids=None, x1=None, x_t=None, v=None, pred=None, loss=None,
             if p.requires_grad and (p.grad is not None):
                 gmeans.append(p.grad.detach().abs().mean().item())
         if gmeans:
-            print(f"grad_abs_mean={sum(gmeans)/len(gmeans):.8e} over {len(gmeans)} trainable params")
-
+            print(
+                f"grad_abs_mean={sum(gmeans)/len(gmeans):.8e} over {len(gmeans)} trainable params"
+            )
 
 
 def setup_amp_and_models(args, model, vae):
-    want_bf16 = bool(getattr(args, 'bf16', False)) or os.environ.get('WAN_BRIDGE_DTYPE', '').lower() == 'bf16'
+    want_bf16 = (
+        bool(getattr(args, "bf16", False))
+        or os.environ.get("WAN_BRIDGE_DTYPE", "").lower() == "bf16"
+    )
     bf16_ok = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
 
     amp_dtype = torch.bfloat16 if (want_bf16 and bf16_ok) else torch.float16
@@ -109,7 +135,7 @@ def setup_amp_and_models(args, model, vae):
         except Exception:
             pass
 
-    scaler = torch.amp.GradScaler('cuda', enabled=(amp_dtype == torch.float16))
+    scaler = torch.amp.GradScaler("cuda", enabled=(amp_dtype == torch.float16))
     return amp_dtype, scaler
 
 
@@ -185,6 +211,17 @@ def build_argparser():
     )
     p.add_argument(
         "--freeze_kv", action="store_true", help="Freeze K/V LoRA (train Q/O only)."
+    )
+    p.add_argument(
+        "--freeze_cross",
+        action="store_true",
+        help="Freeze cross-attn LoRA so only visual stream adapts.",
+    )
+    p.add_argument(
+        "--lr_visual",
+        type=float,
+        default=None,
+        help="Learning rate for visual LoRA layers (self-attn/ffn).",
     )
     p.add_argument(
         "--resume_adapter",
@@ -308,11 +345,13 @@ def _apply_filtered_state(model: nn.Module, state: Dict[str, torch.Tensor]) -> N
         ):
             keep[k] = v
     missing, unexpected = model.load_state_dict(keep, strict=False)
-    print(f"[load] loaded {len(state)} keys; missing={len(missing)} unexpected={len(unexpected)}")
+    print(
+        f"[load] loaded {len(state)} keys; missing={len(missing)} unexpected={len(unexpected)}"
+    )
     print("[head abs-mean]", float(model.head.head.weight.abs().mean()))
 
 
-def call_dit(model, x_t, t, context, mask=None):
+def call_dit(model, x_t, t, context, mask=None, debug: bool = False):
     """
     Normalizes inputs for WanModel.forward, computes seq_len from Conv3d patcher,
     picks the correct prediction tensor from outputs, and returns a Tensor with
@@ -324,10 +363,10 @@ def call_dit(model, x_t, t, context, mask=None):
 
     # ---- 1) Normalize x_t to [B,C,T,H,W], remember original layout ----
     if x_t.dim() == 5:
-        if x_t.size(1) == c_in:             # [B,C,T,H,W]
+        if x_t.size(1) == c_in:  # [B,C,T,H,W]
             B, C, T, H, W = x_t.shape
             x_bcthw, orig = x_t, "BCTHW"
-        elif x_t.size(2) == c_in:           # [B,T,C,H,W] -> [B,C,T,H,W]
+        elif x_t.size(2) == c_in:  # [B,T,C,H,W] -> [B,C,T,H,W]
             B, T, C, H, W = x_t.shape
             x_bcthw, orig = x_t.permute(0, 2, 1, 3, 4).contiguous(), "BTCHW"
         else:
@@ -338,7 +377,7 @@ def call_dit(model, x_t, t, context, mask=None):
             else:
                 B, T, C, H, W = x_t.shape
                 x_bcthw, orig = x_t.permute(0, 2, 1, 3, 4).contiguous(), "BTCHW"
-    elif x_t.dim() == 4:                    # [B,C,H,W] -> [B,C,1,H,W]
+    elif x_t.dim() == 4:  # [B,C,H,W] -> [B,C,1,H,W]
         B, C, H, W = x_t.shape
         T = 1
         x_bcthw, orig = x_t.unsqueeze(2).contiguous(), "BCHW"
@@ -352,23 +391,34 @@ def call_dit(model, x_t, t, context, mask=None):
 
     # ---- 2) seq_len from Conv3d patcher (exact) ----
     def _as3(v, default):
-        if isinstance(v, int): return (v, v, v)
-        if isinstance(v, (list, tuple)) and len(v) == 3: return tuple(int(x) for x in v)
+        if isinstance(v, int):
+            return (v, v, v)
+        if isinstance(v, (list, tuple)) and len(v) == 3:
+            return tuple(int(x) for x in v)
         return default
+
     kT, kH, kW = _as3(getattr(pe, "kernel_size", (1, 2, 2)), (1, 2, 2))
-    sT, sH, sW = _as3(getattr(pe, "stride",      (1, 2, 2)), (1, 2, 2))
-    pT, pH, pW = _as3(getattr(pe, "padding",     (0, 0, 0)), (0, 0, 0))
-    dT, dH, dW = _as3(getattr(pe, "dilation",    (1, 1, 1)), (1, 1, 1))
-    def _conv_out(n, k, s, p, d): return (n + 2*p - d*(k - 1) - 1) // s + 1
-    T_out = _conv_out(T, kT, sT, pT, dT); H_out = _conv_out(H, kH, sH, pH, dH); W_out = _conv_out(W, kW, sW, pW, dW)
-    seq_len = int(T_out * H_out * W_out); assert seq_len > 0
+    sT, sH, sW = _as3(getattr(pe, "stride", (1, 2, 2)), (1, 2, 2))
+    pT, pH, pW = _as3(getattr(pe, "padding", (0, 0, 0)), (0, 0, 0))
+    dT, dH, dW = _as3(getattr(pe, "dilation", (1, 1, 1)), (1, 1, 1))
+
+    def _conv_out(n, k, s, p, d):
+        return (n + 2 * p - d * (k - 1) - 1) // s + 1
+
+    T_out = _conv_out(T, kT, sT, pT, dT)
+    H_out = _conv_out(H, kH, sH, pH, dH)
+    W_out = _conv_out(W, kW, sW, pW, dW)
+    seq_len = int(T_out * H_out * W_out)
+    assert seq_len > 0
 
     # ---- 3) Build forward inputs ----
-    x_list = [x_bcthw[i] for i in range(B)]            # each [C,T,H,W]
+    x_list = [x_bcthw[i] for i in range(B)]  # each [C,T,H,W]
 
     t = t.reshape(-1).to(device)
-    if t.numel() == 1:  t = t.repeat(B)
-    elif t.numel() != B: t = t[:1].repeat(B)
+    if t.numel() == 1:
+        t = t.repeat(B)
+    elif t.numel() != B:
+        t = t[:1].repeat(B)
 
     # context -> List[Tensor [L, D_exp]]
     te = getattr(model, "text_embedding", None)
@@ -376,33 +426,45 @@ def call_dit(model, x_t, t, context, mask=None):
     if te is not None:
         for m in te.modules():
             if isinstance(m, torch.nn.Linear):
-                D_exp = int(m.in_features); break
-    if D_exp is None: D_exp = 4096
+                D_exp = int(m.in_features)
+                break
+    if D_exp is None:
+        D_exp = 4096
 
     def _pad_trunc_lastdim(c: torch.Tensor) -> torch.Tensor:
         c = c.to(device)
         d = c.size(-1)
-        if d == D_exp: return c
-        if d <  D_exp: return F.pad(c, (0, D_exp - d))
+        if d == D_exp:
+            return c
+        if d < D_exp:
+            return F.pad(c, (0, D_exp - d))
         return c[..., :D_exp]
 
     if isinstance(context, torch.Tensor):
-        if context.dim() == 3:      # [B,L,D]
-            context_list = [_pad_trunc_lastdim(context[i]) for i in range(min(B, context.size(0)))]
+        if context.dim() == 3:  # [B,L,D]
+            context_list = [
+                _pad_trunc_lastdim(context[i]) for i in range(min(B, context.size(0)))
+            ]
             if len(context_list) < B:
                 context_list += [context_list[0]] * (B - len(context_list))
-        elif context.dim() == 2:    # [L,D]
+        elif context.dim() == 2:  # [L,D]
             c = _pad_trunc_lastdim(context)
             context_list = [c for _ in range(B)]
         else:
-            raise AssertionError(f"Unexpected context tensor shape {tuple(context.shape)}")
+            raise AssertionError(
+                f"Unexpected context tensor shape {tuple(context.shape)}"
+            )
     else:
         tmp = []
         for c in context:
             c = torch.as_tensor(c, device=device)
-            if c.dim() != 2: raise AssertionError(f"Each context item must be [L,D], got {tuple(c.shape)}")
+            if c.dim() != 2:
+                raise AssertionError(
+                    f"Each context item must be [L,D], got {tuple(c.shape)}"
+                )
             tmp.append(_pad_trunc_lastdim(c))
-        if len(tmp) != B: tmp = [tmp[0] for _ in range(B)]
+        if len(tmp) != B:
+            tmp = [tmp[0] for _ in range(B)]
         context_list = tmp
 
     context_list = [c.to(dtype=mdtype) for c in context_list]
@@ -413,22 +475,27 @@ def call_dit(model, x_t, t, context, mask=None):
     # ---- 5) Extract prediction tensor and stack correctly ----
     def _ensure_4d_sample(x):
         """Per-sample: want [C,T,H,W]. If [C,H,W], add T=1; if [1,C,T,H,W], squeeze B."""
-        if x.dim() == 4:                      # [C,T,H,W]
+        if x.dim() == 4:  # [C,T,H,W]
             return x
-        if x.dim() == 3:                      # [C,H,W] -> [C,1,H,W]
+        if x.dim() == 3:  # [C,H,W] -> [C,1,H,W]
             return x.unsqueeze(1)
         if x.dim() == 5 and x.size(0) == 1 and x.size(1) == c_in:  # [1,C,T,H,W]
             return x.squeeze(0)
-        raise AssertionError(f"Unexpected per-sample tensor rank {x.dim()} in model output")
+        raise AssertionError(
+            f"Unexpected per-sample tensor rank {x.dim()} in model output"
+        )
 
     def _pick_best_sample_tensor(container):
         # Flatten one level and pick best by abs-mean, preferring channel match.
         cands = []
+
         def _collect(z):
             if torch.is_tensor(z):
                 cands.append(z)
             elif isinstance(z, (list, tuple)):
-                for y in z: _collect(y)
+                for y in z:
+                    _collect(y)
+
         _collect(container)
         assert cands, "No tensor candidate found in model outputs"
 
@@ -438,11 +505,23 @@ def call_dit(model, x_t, t, context, mask=None):
             score = float(tns.detach().abs().mean())
             # Bonus if the first dim (or second when batched sample) equals c_in
             bonus = 0.0
-            if tns.dim() == 4 and tns.size(0) == c_in: bonus = 10.0
-            if tns.dim() == 5 and tns.size(0) == 1 and tns.size(1) == c_in: bonus = 10.0
+            if tns.dim() == 4 and tns.size(0) == c_in:
+                bonus = 10.0
+            if tns.dim() == 5 and tns.size(0) == 1 and tns.size(1) == c_in:
+                bonus = 10.0
             sc = score * (1.0 + bonus)
-            
-            print("cand", tns.shape, "absmean=", float(tns.detach().abs().mean()), "bonus=", bonus, "score=", sc)
+
+            if debug:
+                print(
+                    "cand",
+                    tns.shape,
+                    "absmean=",
+                    float(tns.detach().abs().mean()),
+                    "bonus=",
+                    bonus,
+                    "score=",
+                    sc,
+                )
             if sc > best_score:
                 try:
                     candidate = _ensure_4d_sample(tns)
@@ -457,7 +536,7 @@ def call_dit(model, x_t, t, context, mask=None):
         if out.dim() == 5:
             y_bcthw = out
         elif out.dim() == 4:
-            y_bcthw = out.unsqueeze(2)        # [B,C,H,W] -> [B,C,1,H,W]
+            y_bcthw = out.unsqueeze(2)  # [B,C,H,W] -> [B,C,1,H,W]
         else:
             raise AssertionError(f"Unexpected batched output rank {out.dim()}")
     elif isinstance(out, (list, tuple)):
@@ -478,7 +557,6 @@ def call_dit(model, x_t, t, context, mask=None):
         y = y_bcthw.squeeze(2).contiguous()
 
     return y.to(x_t.dtype)
-
 
 
 @torch.no_grad()
@@ -508,9 +586,11 @@ def _to_bthwc(x: torch.Tensor) -> torch.Tensor:
         # BHWC -> BTHWC (T=1)
         if x.size(-1) in (1, 3):
             return x.unsqueeze(1).contiguous()
-    raise AssertionError(f"Unexpected pixel tensor shape {tuple(x.shape)}; expected BCHW/BTCHW/BHWC/BTHWC.")
-    
-    
+    raise AssertionError(
+        f"Unexpected pixel tensor shape {tuple(x.shape)}; expected BCHW/BTCHW/BHWC/BTHWC."
+    )
+
+
 @torch.no_grad()
 def encode_pixels_to_latents(vae, pixels):
     x = _to_bthwc(pixels)
@@ -588,10 +668,12 @@ def main(args):
         dropout=0.0,
         blocks_range=None,
     )
-    
+
     hit_counts = {}
+
     def _fw_hook(mod, inp, out):
         hit_counts[id(mod)] = hit_counts.get(id(mod), 0) + 1
+
     for m in model.modules():
         if isinstance(m, LoRALinear):
             m.register_forward_hook(_fw_hook)
@@ -610,12 +692,36 @@ def main(args):
                 if name.endswith(".k") or name.endswith(".v"):
                     for p in module.trainable_parameters():
                         p.requires_grad_(False)
-    # gather params
-    params = [p for p in lora_parameters(model) if p.requires_grad]
+    # Freeze cross-attn LoRA if requested
+    if args.freeze_cross:
+        for name, module in model.named_modules():
+            if isinstance(module, LoRALinear) and ".cross_attn." in name:
+                for p in module.trainable_parameters():
+                    p.requires_grad_(False)
+
+    # Build param groups: text vs visual
+    text_params, visual_params = [], []
+    for name, module in model.named_modules():
+        if isinstance(module, LoRALinear):
+            bucket = (
+                visual_params if (".attn." in name or ".ffn." in name) else text_params
+            )
+            for p in module.trainable_parameters():
+                if p.requires_grad:
+                    bucket.append(p)
+
+    params = text_params + visual_params
     n_params = count_params(params)
     print(
-        f"[lora] Trainable LoRA params: {n_params/1e6:.3f} M across targets={targets} (freeze_kv={args.freeze_kv})"
+        f"[lora] Trainable LoRA params: {n_params/1e6:.3f} M across targets={targets} "
+        f"(freeze_kv={args.freeze_kv} freeze_cross={args.freeze_cross})"
     )
+
+    opt_groups = []
+    if text_params:
+        opt_groups.append({"params": text_params, "lr": args.lr})
+    if visual_params:
+        opt_groups.append({"params": visual_params, "lr": (args.lr_visual or args.lr)})
 
     # Text encoder (Bridge) runs inside Wan via environment, but we use it here to produce tokens
     # so we can control masking & pass through model.text_embedding.
@@ -650,23 +756,32 @@ def main(args):
 
     # Optimizer
     opt = torch.optim.AdamW(
-        params, lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.95)
+        opt_groups, weight_decay=args.weight_decay, betas=(0.9, 0.95)
     )
-    _ = torch.cuda.amp.GradScaler(enabled=False)  # bf16 uses autocast without scaler
     model.train()
     set_lora_enabled(model, True)
-    
+
     trainable = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
-    print(f"[sanity] trainable tensors: {len(trainable)}  total_params={sum(p.numel() for _,p in trainable):,}")
+    print(
+        f"[sanity] trainable tensors: {len(trainable)}  total_params={sum(p.numel() for _,p in trainable):,}"
+    )
     for n, p in trainable[:8]:
         print("   ", n, tuple(p.shape))
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    
+
     # ==== USAGE IN TRAIN LOOP (replace your loss/backward block) ====
     # After you have constructed model/vae/optimizer and parsed args:
     AMP_DTYPE, scaler = setup_amp_and_models(args, model, vae)
+
+    # Keep only the small LoRA matrices in fp32 for stability
+    from kv_lora_inject import LoRALinear as _LoRALinear
+
+    for m in model.modules():
+        if isinstance(m, _LoRALinear) and m.lora_A is not None:
+            m.lora_A.data = m.lora_A.data.float()
+            m.lora_B.data = m.lora_B.data.float()
 
     step = 0
     running = 0.0
@@ -677,11 +792,17 @@ def main(args):
                 break
             vids = batch["pixel"].to(device)  # [B,T,3,H,W]
             caps: List[str] = batch["caption"]
-            
+
             if step == 0:
                 try:
-                    print("[once] vids shape/dtype:", tuple(vids.shape), vids.dtype,
-                          " min/max:", float(vids.min()), float(vids.max()))
+                    print(
+                        "[once] vids shape/dtype:",
+                        tuple(vids.shape),
+                        vids.dtype,
+                        " min/max:",
+                        float(vids.min()),
+                        float(vids.max()),
+                    )
                 except Exception:
                     pass
 
@@ -700,45 +821,69 @@ def main(args):
             # flow-matching pair
             x_t, v, t = make_velocity_training_pair(x1)  # x_t/v are dtype=dtype
 
-            with torch.amp.autocast('cuda', dtype=AMP_DTYPE):
-                pred = call_dit(model, x_t, t, context, mask)
+            with torch.amp.autocast("cuda", dtype=AMP_DTYPE):
+                pred = call_dit(model, x_t, t, context, mask, debug=(step % 200 == 0))
                 mse_fp32 = F.mse_loss(pred.float(), v.float())
                 loss = mse_fp32 / args.grad_accum
+            running += float(mse_fp32.item())
 
-            debug_step(step, vids=vids, x1=x1, x_t=x_t, v=v, pred=pred, loss=loss.detach(), t=t, model=model, grad_accum=args.grad_accum, every=200)
+            debug_step(
+                step,
+                vids=vids,
+                x1=x1,
+                x_t=x_t,
+                v=v,
+                pred=pred,
+                loss=loss.detach(),
+                t=t,
+                model=model,
+                grad_accum=args.grad_accum,
+                every=200,
+            )
 
             if scaler.is_enabled():
                 scaler.scale(loss).backward()
             else:
                 loss.backward()
-            
-            print("[lora] modules hit in forward:", sum(hit_counts.values()), "unique:", len(hit_counts))
-            
+
+            if step % 200 == 0:
+                print(
+                    "[lora] modules hit in forward:",
+                    sum(hit_counts.values()),
+                    "unique:",
+                    len(hit_counts),
+                )
+
             if step % 200 == 0:
                 gmeans = []
                 for n, p in model.named_parameters():
                     if p.requires_grad and (p.grad is not None):
                         gmeans.append(p.grad.detach().abs().mean().item())
                 if gmeans:
-                    print(f"[grads] mean(|grad|)={sum(gmeans)/len(gmeans):.3e} over {len(gmeans)} tensors")
+                    print(
+                        f"[grads] mean(|grad|)={sum(gmeans)/len(gmeans):.3e} over {len(gmeans)} tensors"
+                    )
 
             # Gradient step on accumulation boundary:
             if (step + 1) % args.grad_accum == 0:
+                if args.clip_grad and args.clip_grad > 0:
+                    torch.nn.utils.clip_grad_norm_(params, args.clip_grad)
                 if scaler.is_enabled():
                     scaler.step(opt)
                     scaler.update()
                 else:
                     opt.step()
                 opt.zero_grad(set_to_none=True)
-           
-           
 
             step += 1
             pbar.update(1)
             if step % args.log_every == 0:
                 avg = running / args.log_every
                 try:
-                    pbar.set_postfix(mse=f"{mse_fp32.item():.6f}", loss=f"{(mse_fp32.item()/args.grad_accum):.8f}")
+                    pbar.set_postfix(
+                        mse=f"{avg:.6f}",
+                        loss=f"{(avg/args.grad_accum):.8f}",
+                    )
                 except Exception:
                     pass
                 running = 0.0
