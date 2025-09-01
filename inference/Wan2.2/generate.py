@@ -10,9 +10,15 @@ import random
 # Allow running without PYTHONPATH set to repo root
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 try:
-    from kv_lora_inject import inject_lora_kv, load_peft_adapter, LoRALinear
+    from kv_lora_inject import (
+        inject_lora_kv,
+        inject_lora_visual,
+        load_peft_adapter,
+        LoRALinear,
+    )
 except Exception:
     inject_lora_kv = None
+    inject_lora_visual = None
     load_peft_adapter = None
     LoRALinear = None
 
@@ -293,8 +299,8 @@ def _init_logging(rank):
         logging.basicConfig(level=logging.ERROR)
 
 
-def _maybe_load_kv_lora(pipeline, args, logger):
-    """Inject and load KV-LoRA into the Wan transformer inside the pipeline."""
+def _maybe_load_lora_adapter(pipeline, args, logger):
+    """Inject and load LoRA into the Wan transformer inside the pipeline."""
     if not args.lora_adapter_path:
         return
     if load_peft_adapter is None or inject_lora_kv is None:
@@ -305,8 +311,20 @@ def _maybe_load_kv_lora(pipeline, args, logger):
     target = (
         getattr(pipeline, "model", None) or getattr(pipeline, "dit", None) or pipeline
     )
-    # Inject LoRA stubs into cross-attn K/V and load PEFT-ish weights
+    # Inject LoRA stubs into cross-attn K/V
     inject_lora_kv(target, rank=8, alpha=args.lora_alpha)
+    # Also inject self-attention + FFN LoRA stubs so Stage-2/3 adapters load fully
+    try:
+        inject_lora_visual(
+            target,
+            rank=8,
+            alpha=args.lora_alpha,
+            enable_attn=True,
+            enable_ffn=True,
+        )
+    except Exception as e:
+        logger.warning(f"inject_lora_visual failed or unavailable: {e}")
+
     load_peft_adapter(
         target,
         path=args.lora_adapter_path,
@@ -314,7 +332,7 @@ def _maybe_load_kv_lora(pipeline, args, logger):
         alpha=args.lora_alpha,
     )
     logger.info(
-        f"Loaded KV-LoRA adapter: {args.lora_adapter_path} (prefix={args.lora_prefix})"
+        f"Loaded LoRA adapter: {args.lora_adapter_path} (prefix={args.lora_prefix})"
     )
 
 
@@ -423,7 +441,7 @@ def generate(args):
             t5_cpu=args.t5_cpu,
             convert_model_dtype=args.convert_model_dtype,
         )
-        _maybe_load_kv_lora(wan_t2v, args, logging)
+        _maybe_load_lora_adapter(wan_t2v, args, logging)
         if args.lora_adapter_path and LoRALinear is not None:
             target = (
                 getattr(wan_t2v, "model", None)
@@ -460,7 +478,7 @@ def generate(args):
             t5_cpu=args.t5_cpu,
             convert_model_dtype=args.convert_model_dtype,
         )
-        _maybe_load_kv_lora(wan_ti2v, args, logging)
+        _maybe_load_lora_adapter(wan_ti2v, args, logging)
         if args.lora_adapter_path and LoRALinear is not None:
             target = (
                 getattr(wan_ti2v, "model", None)
@@ -499,7 +517,7 @@ def generate(args):
             t5_cpu=args.t5_cpu,
             convert_model_dtype=args.convert_model_dtype,
         )
-        _maybe_load_kv_lora(wan_s2v, args, logging)
+        _maybe_load_lora_adapter(wan_s2v, args, logging)
         if args.lora_adapter_path and LoRALinear is not None:
             target = (
                 getattr(wan_s2v, "model", None)
@@ -541,7 +559,7 @@ def generate(args):
             t5_cpu=args.t5_cpu,
             convert_model_dtype=args.convert_model_dtype,
         )
-        _maybe_load_kv_lora(wan_i2v, args, logging)
+        _maybe_load_lora_adapter(wan_i2v, args, logging)
         if args.lora_adapter_path and LoRALinear is not None:
             target = (
                 getattr(wan_i2v, "model", None)
